@@ -1,0 +1,1731 @@
+================================================================================
+ JARVIS AI - CHANGE LOG / MEMORIES
+ Session date : 2026-09-21
+ Goal         : make JARVIS actually control this PC from spoken commands,
+                instead of only being able to talk about doing it.
+ Result       : 17/17 end-to-end voice commands now call the correct tool.
+                44/47 runnable PC-control tools verified working on this machine.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ 0. THE SHORT VERSION - WHAT WAS ACTUALLY WRONG
+--------------------------------------------------------------------------------
+
+The Notes file described a finished system, and the code was genuinely there
+(76 tools, 59KB of tools.py). But three things meant that in practice JARVIS
+could not reliably act on a command:
+
+  1. HALF THE TOOLS COULD NOT RUN.
+     The virtual environment JARVIS actually runs from was missing psutil,
+     pyautogui, pyperclip, pillow, screen-brightness-control and send2trash.
+     Every tool in the info / input / screen / clipboard / apps / recycle
+     families returned "not installed" instead of doing anything. Because those
+     imports were inside try/except blocks, nothing crashed - it just quietly
+     did nothing, which is why it looked like the AI was "ignoring" commands.
+
+  2. FOUR TOOLS WERE UNREACHABLE, AND ONE DID NOT EXIST.
+     brain.py decides which tools to show the model using a category map. That
+     map listed a tool called list_ai_providers that is not in tools.py, and it
+     omitted ask_llama, ask_qwen, ask_local_model and list_available_ais - so
+     those four could never be called, no matter what you said.
+
+  3. THE MODEL INVENTED ANSWERS ABOUT YOUR PC.
+     This was the worst one. Asked "what's in my downloads folder", qwen2.5:7b
+     replied with a confident made-up list: "file1.pdf, video1.mp4,
+     app_installer.exe". Asked about the clipboard, it invented "example text".
+     Nothing in the system prompt forbade fabricating PC data, only describing
+     actions instead of taking them.
+
+All three are fixed and verified. Details below.
+
+
+--------------------------------------------------------------------------------
+ 1. FILES CHANGED / ADDED
+--------------------------------------------------------------------------------
+
+MODIFIED
+  backend/brain.py       tool gating rewritten; anti-fabrication prompt rule
+  backend/server.py      crash-proof logging; final reply now de-duplicated
+  backend/tools.py       brightness tools hardened
+  requirements.txt       the six missing PC-control packages, with per-line notes
+
+ADDED
+  backend/selftest_tools.py   tiered PASS/FAIL harness for all 76 tools
+  backend/test_commands.py    end-to-end test: does the model CALL the right tool
+  capability_report.txt       generated output of the self-test on this machine
+  memories.txt                this file
+
+BACKUPS (originals, untouched, delete when you're happy)
+  backend/brain.py.bak
+  backend/server.py.bak
+  backend/tools.py.bak
+  requirements.txt.bak
+
+NOT TOUCHED
+  backend/mobile.html, backend/memory.py, models/, docker-compose.yml,
+  backend/main.py, stt.py, tts.py, wake_word.py, brain_with_tools.py,
+  the old test_*.py stubs
+
+
+--------------------------------------------------------------------------------
+ 2. ENVIRONMENT - WHICH VENV IS THE REAL ONE
+--------------------------------------------------------------------------------
+
+There are three virtual environments in this project and only one is live:
+
+  jarvis-env\           <-- THIS IS THE ONE. Python 3.12.10, has ollama,
+                            fastapi, uvicorn, piper, and now everything else.
+  venv\                 empty, nothing installed. The Notes file points at this
+                        one, which is misleading.
+  backend\jarvis-env\   Python 3.14.3, empty. Ignore it.
+
+Installed into jarvis-env this session:
+
+  psutil                    system_info, battery_status, top_processes,
+                            list_running_apps
+  pyautogui                 type_text, press_key, press_hotkey, move_mouse,
+                            click_mouse, scroll_screen, volume keys, media keys
+  pyperclip                 get_clipboard, set_clipboard
+  pillow                    take_screenshot
+  screen-brightness-control brightness_up / brightness_down
+  send2trash                delete_path (Recycle Bin, not permanent delete)
+  requests                  cloud AI fallbacks
+
+Command used:
+  .\jarvis-env\Scripts\python.exe -m pip install psutil pyautogui pyperclip ^
+      pillow screen-brightness-control send2trash requests
+
+If PC control ever goes dead again, this is the first thing to check.
+
+
+--------------------------------------------------------------------------------
+ 3. CHANGES TO backend/brain.py
+--------------------------------------------------------------------------------
+
+3.1  ANTI-FABRICATION RULE IN THE SYSTEM PROMPT  (the most important change)
+
+     Added a "GROUND TRUTH" section, placed above the TOOL USE section so it
+     carries the most weight. In plain terms it tells the model:
+
+       - You have NO direct knowledge of this PC. Files, folders, clipboard,
+         processes, apps, IP, battery, time and weather must come from a tool
+         result you actually received.
+       - NEVER invent or illustrate PC data. No 'file1.pdf', no 'example text'.
+         A made-up answer about the user's own machine is the worst mistake
+         you can make.
+       - If you haven't seen a tool result for what was asked, call the tool NOW.
+       - If no tool can answer it, say you cannot check - never improvise.
+
+     Effect, measured: "what's in my downloads folder" went from a fabricated
+     file list to a real list_dir call.
+
+3.2  TOOL CATEGORY MAP FIXED
+
+     - removed  list_ai_providers   (does not exist in tools.py)
+     - added    ask_llama, ask_qwen, ask_local_model, list_available_ais
+     - added a startup drift check that prints a warning if tools.py and the
+       category map ever disagree again, in either direction. Silence at
+       startup means they match.
+
+     Registry, schemas and categories are now all exactly 76 entries with zero
+     mismatches.
+
+3.3  "ask qwen" / "ask llama" NOW RECOGNISED
+
+     CATEGORY_KEYWORDS["ai"] had "ask deepseek", "ask chatgpt", "ask claude",
+     "ask gemini" but not "ask qwen", "ask llama" or "ask local model". Added.
+
+3.4  ACTION-INTENT FALLBACK - the fix for "it just talks instead of doing it"
+
+     Before: tool selection was purely keyword based, so a command whose
+     phrasing wasn't in the keyword lists got ZERO tools handed to the model.
+     With no tools available it could only reply in prose. "jarvis, could you
+     tidy up my pc" got nothing.
+
+     Now: if no category matches but the sentence still reads like a command
+     (imperative verb at the start, or a phrase like "my pc" / "for me" /
+     "right now"), JARVIS is handed CORE_ACTION_TOOLS - a curated set of 26
+     high-value tools.
+
+     Deliberately 26 and not all 76: dumping every schema at the model is what
+     caused the hallucinated tool JSON recorded as bug 8 in Notes.
+
+3.5  SMALL-TALK GUARD
+
+     The action fallback initially caught "tell me a joke" and handed over 26
+     tools, because "tell" was in the imperative verb list. Two fixes:
+       - dropped the conversational verbs (tell, give, look, check) from the
+         imperative pattern
+       - added an explicit _SMALL_TALK list ("tell me a joke", "make me laugh",
+         "who are you", "what can you do", "thanks", ...) that short-circuits
+         the fallback
+     Small talk is back to 0 tools, as intended.
+
+3.6  CATEGORY SCORING - generalises the "list my desktop" fix
+
+     Before: every category whose keyword appeared anywhere fired at once.
+     "show desktop" triggered both window and files, which is Notes bug 11.
+     That bug had been patched for one specific phrase only.
+
+     Now each category is scored by the LENGTH of the longest keyword it
+     matched, so a specific phrase beats an incidental word. Categories more
+     than SCORE_MARGIN (4) characters weaker than the winner are dropped, and
+     at most MAX_CATEGORIES (3) survive. memory and ai are pinned - they are
+     explicit-intent categories and are never dropped by the cap.
+
+     Measured: "show desktop" went from 18 tools across files+window to 5
+     tools in window only.
+
+3.7  FILES-PHRASE OVERRIDE SOFTENED
+
+     "what's in my X" used to force files-only. That meant "what's in my
+     clipboard" was answered with file tools and get_clipboard was literally
+     not on the menu - the model reached for run_shell_command instead.
+
+     Now the files phrase only nudges files one point past whatever else
+     matched, instead of overriding it. "what's in my clipboard" offers
+     clipboard + files and calls get_clipboard. "list my desktop" still
+     resolves to files only.
+
+
+--------------------------------------------------------------------------------
+ 4. CHANGES TO backend/server.py
+--------------------------------------------------------------------------------
+
+4.1  CRASH-PROOF CONSOLE LOGGING  (this one could kill a live session)
+
+     The Windows console is cp1252. server.py printed the user's text, tool
+     names and session info directly. Any character outside cp1252 - an emoji
+     in a filename, a non-Latin app name - made print() raise
+     UnicodeEncodeError inside the WebSocket handler, which fell through to the
+     generic except and ENDED THE SESSION. A command could kill your
+     connection purely because of a logging statement.
+
+     I hit this for real: the self-test crashed printing an installed app name
+     containing U+A789.
+
+     Added a log() helper that falls back to a replacement-character encode,
+     and routed all 11 print sites through it. log() is defined above the
+     warmup block so it exists before its first use at import time.
+
+4.2  FINAL REPLY NOW DE-DUPLICATED
+
+     Found by live WebSocket test, not by reading the code. Asked "how much RAM
+     am I using", the phone received:
+
+       "You are using 91.4% of your RAM, which is 14 out of 15 gigabytes.
+        You are using 91.4% of your RAM, which is 14 out of 15 gigabytes."
+
+     Cause: dedupe_reply was applied to brain's "done" payload, but server.py
+     built the final "replace" message from full_reply - the raw accumulated
+     token stream, which never went through it. So the anti-repetition fix from
+     Notes bug 15 was being bypassed on the exact text the phone displays.
+
+     Fixed: the final text now runs through dedupe_reply(text, user_text).
+     Re-tested live, the duplication is gone.
+
+
+--------------------------------------------------------------------------------
+ 5. CHANGES TO backend/tools.py
+--------------------------------------------------------------------------------
+
+5.1  BRIGHTNESS TOOLS HARDENED
+
+     Your Asus VS197 does not support DDC/CI, so
+     screen_brightness_control.get_brightness() returns an empty list. The old
+     code did cur[0] on it and raised IndexError, and the raw error text
+     "Brightness control unavailable: ... -> IndexError" was handed to the
+     model as a tool result.
+
+     Rewrote both into one _set_brightness(delta) helper that handles empty
+     list, None, and set failure, and returns a sentence the model can just
+     say out loud:
+
+       "This monitor does not support software brightness control (no DDC/CI).
+        Use the buttons on the monitor itself."
+
+     This is a hardware limit, not a bug. It is the one PC-control capability
+     this machine genuinely does not have. brightness_up / brightness_down are
+     deliberately still reported as FAIL in the capability report so the gap
+     stays visible rather than looking like it works.
+
+
+--------------------------------------------------------------------------------
+ 6. NEW: backend/selftest_tools.py  -  DOES EACH TOOL WORK?
+--------------------------------------------------------------------------------
+
+Runs the tools for real and prints a PASS/FAIL table. Four risk tiers, so you
+choose how much it is allowed to touch:
+
+  safe         read-only, or writes only inside a temp sandbox, or reverts
+               itself immediately.                        Default.
+  desktop      drives the real keyboard, mouse, volume, brightness and
+               notifications, then puts everything back.  --desktop
+  loud         pops a window onto your screen: notepad, browser tabs, Win+D.
+               Left for you to run when you're ready.     --loud
+  ai           local LLM round trips, slow.               --ai
+
+  destructive  NEVER run automatically: shutdown_pc, restart_pc, sleep_pc,
+               lock_screen, kill_process, empty_recycle_bin, close_window,
+               close_app, abort_shutdown, set_env.
+
+A tool that returns its own error string ("not installed", "error:", "does not
+support") counts as FAIL, not PASS - otherwise a tool that politely reports
+failure would look like it works.
+
+Usage:
+  cd "C:\Users\Home\Desktop\AI\Jarvis AI\backend"
+  ..\jarvis-env\Scripts\python.exe selftest_tools.py
+  ..\jarvis-env\Scripts\python.exe selftest_tools.py --desktop
+  ..\jarvis-env\Scripts\python.exe selftest_tools.py --loud --ai
+  ..\jarvis-env\Scripts\python.exe selftest_tools.py --desktop --report ..\capability_report.txt
+
+RESULT ON THIS MACHINE (safe + desktop):   PASS 44   FAIL 3   SKIP 19
+
+  Verified working: get_time, system_info, battery_status, top_processes,
+  run_shell_command, list_dir, read_file, write_file, create_folder, copy_path,
+  move_path, find_files, grep_files, zip_path, unzip_path, delete_path,
+  take_screenshot, list_running_apps, list_installed_apps, get_clipboard,
+  set_clipboard, run_python, set_timer, get_ip, ping_host, check_port,
+  get_weather, git_status, get_env, remember_fact, list_user_facts,
+  forget_fact, list_available_ais, volume_up, volume_down, mute_toggle,
+  move_mouse, type_text, press_key, press_hotkey, scroll_screen,
+  send_notification, flush_dns
+
+  The 3 failures are environmental, not code:
+    brightness_up / brightness_down  monitor has no DDC/CI (see 5.1)
+    docker_ps                        Docker Desktop was not running
+
+
+--------------------------------------------------------------------------------
+ 7. NEW: backend/test_commands.py  -  DOES IT CALL THE RIGHT TOOL?
+--------------------------------------------------------------------------------
+
+The harder and more important test. selftest_tools.py proves a tool works when
+called directly; this proves the model DECIDES to call it when you speak.
+
+Every case is read-only: nothing deleted, no window opened, no key pressed. Any
+test fact written to memory is removed at the end of the run.
+
+  ..\jarvis-env\Scripts\python.exe test_commands.py
+  ..\jarvis-env\Scripts\python.exe test_commands.py --verbose
+  ..\jarvis-env\Scripts\python.exe test_commands.py --report ..\command_report.txt
+
+FINAL RESULT:  PASS 17   FAIL 0
+
+  'what time is it'                      ->  get_time              5.5s
+  'how much RAM am I using'              ->  system_info           4.2s
+  'what are my top processes'            ->  top_processes         6.2s
+  'list my desktop'                      ->  list_dir             11.2s
+  "what's in my downloads folder"        ->  list_dir             18.0s
+  'what apps are running'                ->  list_running_apps    18.4s
+  "what's my IP address"                 ->  get_ip                6.3s
+  'ping google.com'                      ->  ping_host            11.2s
+  "what's the weather"                   ->  get_weather           6.8s
+  "what's in my clipboard"               ->  get_clipboard         8.6s
+  'remember that my test colour is teal' ->  remember_fact         6.1s
+  'what do you know about me'            ->  list_user_facts       3.6s
+  'which AIs can you talk to'            ->  list_available_ais    9.1s
+  'hello'                                ->  no tool  (correct)    1.1s
+  'how are you'                          ->  no tool  (correct)    1.2s
+  'tell me a joke'                       ->  no tool  (correct)    1.1s
+  'thanks'                               ->  no tool  (correct)    1.1s
+
+For comparison, the same suite before the changes: PASS 15 FAIL 2, with the two
+failures being fabricated answers about your own PC.
+
+Add a case to the CASES list whenever you find a phrasing JARVIS mishandles.
+That turns a one-off annoyance into something that stays fixed.
+
+
+--------------------------------------------------------------------------------
+ 8. LIVE END-TO-END VERIFICATION
+--------------------------------------------------------------------------------
+
+The full stack was started and driven over the real WebSocket, the same path the
+phone uses - not just the Python functions in isolation.
+
+  GET /health              ->  {"status":"online","model":"qwen2.5:7b"}
+  GET /                    ->  200 (mobile.html served)
+  warmup                   ->  [warmup] qwen2.5:7b loaded
+
+  "what time is it"        ->  tool get_time, 1 TTS audio chunk returned,
+                               "The current date and time is Monday,
+                                September 21, 2026 at 04:20 AM."
+
+  "take a screenshot"      ->  tool take_screenshot, file actually written
+  "what's in my clipboard" ->  tool get_clipboard, read your real clipboard
+  "how much RAM am I using"->  tool system_info, no duplicated sentence
+
+  "list my desktop"        ->  tool list_dir, and the listing included
+                               jarvis_shot_20260921_042023.png - the screenshot
+                               JARVIS had taken moments earlier. Proof the
+                               actions are landing on the real filesystem.
+
+TTS, tool calling, memory and the WebSocket protocol all work together.
+
+
+--------------------------------------------------------------------------------
+ 9. HOW TO START IT (corrected - the Notes version points at the wrong venv)
+--------------------------------------------------------------------------------
+
+  # Terminal 1 - Ollama (usually already running as a service)
+  ollama serve
+
+  # Terminal 2 - backend. Note jarvis-env, NOT venv.
+  cd "C:\Users\Home\Desktop\AI\Jarvis AI\backend"
+  ..\jarvis-env\Scripts\python.exe -m uvicorn server:app --host 0.0.0.0 --port 8000
+
+  # Terminal 3 - tunnel
+  cloudflared tunnel --url http://localhost:8000
+
+Then open the *.trycloudflare.com URL on your phone in Chrome.
+
+Installed Ollama models right now: qwen2.5:7b (active), qwen2.5:14b.
+Do not switch to 14b on this hardware - see section 10.
+
+
+--------------------------------------------------------------------------------
+ 10. THINGS TO KNOW / STILL OPEN
+--------------------------------------------------------------------------------
+
+ 1. RAM is tight. system_info read 83-91% used during testing, with only the
+    7b model loaded. The Notes claim of ~10GB headroom is optimistic on a 16GB
+    box. This is why the PC crashed on qwen2.5:14b. Keep 14b unloaded.
+
+ 2. Docker Desktop is installed but was not running, so docker_ps fails. Start
+    Docker Desktop if you want that tool. Not required for anything else.
+
+ 3. The "loud" self-test tier has never been run - it opens notepad, three
+    browser tabs and hits Win+D. I left that for you to trigger deliberately
+    rather than hijacking your screen. The underlying machinery it would test
+    (pyautogui keyboard, mouse, os.startfile) is already proven by the desktop
+    tier passing.
+
+ 4. ask_deepseek and ask_llama point at deepseek-r1:8b and llama3.2:3b, which
+    are NOT installed. tools.py falls back to a model that is present, so they
+    do not error - but they will not give you a genuinely different model's
+    opinion until you run: ollama pull llama3.2:3b
+
+ 5. Not in git. There is no repository here, so these .bak files are the only
+    undo available. Running "git init" and committing would be worth doing
+    before the next round of changes.
+
+ 6. The screenshot reply said "is now open on your desktop" when the file was
+    only saved, not opened. Harmless embellishment, but it is the same instinct
+    that produced the fabricated file list. Worth watching.
+
+ 7. Notes file corrections: it says venv\ is the environment (it's jarvis-env\),
+    and lists SpeechRecognition + pyaudio as prerequisites (not needed - the
+    phone is the microphone).
+
+
+--------------------------------------------------------------------------------
+ 11. VERIFICATION SUMMARY - WHAT WAS ACTUALLY MEASURED, NOT ASSUMED
+--------------------------------------------------------------------------------
+
+  Package imports in jarvis-env             10/10 OK
+  brain.py / server.py / tools.py compile   clean, zero warnings
+  registry vs schemas vs categories         76 / 76 / 76, zero mismatches
+  Tool gating on 26 sample phrasings        all correct
+  Direct tool execution (safe + desktop)    44 PASS, 3 FAIL (all environmental)
+  End-to-end command -> tool call           17 PASS, 0 FAIL
+  Live WebSocket round trip                 tool call + TTS audio + reply OK
+  Real filesystem side effect               confirmed (screenshot written)
+
+================================================================================
+ End of log.
+================================================================================
+
+
+================================================================================
+ SESSION 2 - 2026-09-21
+ Goal   : (a) fix "the Jarvis AI folder does not exist" and make path handling
+              work for every AI, especially Claude Code
+          (b) let JARVIS drive VS Code and Claude Code by voice
+ Result : path handling fixed and verified. VS Code + read-only Claude Code work
+          reliably. The Claude Code EDIT path is safe but routes correctly only
+          about 3 times in 5 - see section S2-7. Read that before trusting it.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ S2-1. WHAT WENT WRONG WITH "OPEN VS CODE ON THE JARVIS AI FOLDER"
+--------------------------------------------------------------------------------
+
+Reported symptom: JARVIS said the Jarvis AI folder "does not exist in your
+documents directory" and offered to create it.
+
+Reproduced exactly. Two separate faults:
+
+  1. resolve_path had no idea what "Jarvis AI" was. Its alias table only knew
+     desktop / documents / downloads / home. Anything else fell through to
+     os.path.expanduser(), which for a bare name like "Jarvis AI" returns the
+     string unchanged - a RELATIVE path. That then resolved against whatever
+     directory uvicorn happened to be started from, so it pointed at nothing.
+
+  2. The model then invented the explanation. The tool's actual error was
+     "Error: 'Jarvis AI' is not a folder" - it never mentioned Documents.
+     qwen2.5:7b supplied "in your documents directory" itself, then offered to
+     create a folder there. Saying yes would have created a junk folder.
+
+Fault 2 is the same fabrication instinct logged as item 6 of session 1. The
+cause is the same: when a tool result carries no information, the model fills
+the gap. The fix is therefore to make the tool say more, not just to scold the
+model in the prompt.
+
+
+--------------------------------------------------------------------------------
+ S2-2. resolve_path REWRITTEN  (backend/tools.py)
+--------------------------------------------------------------------------------
+
+All 14 path-taking tools already funnel through resolve_path, so fixing that one
+function fixed read_file, write_file, list_dir, create_folder, move_path,
+copy_path, delete_path, find_files, grep_files, open_path, zip_path, unzip_path,
+take_screenshot and git_status in one edit.
+
+  PROJECT_ROOT        derived from __file__, so it stays correct if you move or
+                      rename the whole folder. No hardcoded path.
+
+  new aliases         jarvis, jarvis ai, jarvis folder, jarvis ai folder,
+                      the jarvis folder, my jarvis folder, project, the project,
+                      my project, project folder, project root, backend,
+                      jarvis backend
+
+  spacing-insensitive The model writes "JarvisAI", "jarvis-ai" and "Jarvis_AI"
+                      interchangeably. Matching now ignores spaces, hyphens and
+                      underscores, so all of those resolve. Verified.
+
+  compound paths      The model also composes paths like
+                      "my desktop/AI/Jarvis AI" and "documents\notes". The first
+                      segment is resolved as an alias and the rest joined onto
+                      it. Verified for both slash directions.
+
+  multi-root search   A bare name is now looked for in the project, Desktop,
+                      Documents, Downloads and home, case-insensitively.
+
+  ALWAYS ABSOLUTE     resolve_path can no longer return a relative path. When a
+                      name is genuinely unknown it anchors to PROJECT_ROOT
+                      rather than the process working directory, so any path in
+                      an error message is stable and true.
+
+Verified: 'Jarvis AI', 'jarvis ai', 'JarvisAI', 'jarvis-ai', 'Jarvis_AI',
+'the project', 'TheProject', 'jarvis ai/backend', 'my desktop/AI/Jarvis AI',
+'desktop\AI\Jarvis AI', 'home/Desktop/AI/Jarvis AI', 'Notes', 'memories.txt'
+all resolve to the correct existing path.
+
+
+--------------------------------------------------------------------------------
+ S2-3. ERROR MESSAGES THAT LEAVE NOTHING TO INVENT
+--------------------------------------------------------------------------------
+
+New path_not_found() returns, for example:
+
+  No file or folder named 'nonexistent_zzz' was found. Looked in:
+  C:\Users\Home\Desktop\AI\Jarvis AI, C:\Users\Home\Desktop,
+  C:\Users\Home\Documents, C:\Users\Home\Downloads, C:\Users\Home.
+  Ask for the full path if you need somewhere else.
+
+Wired into list_dir and read_file. Both also now distinguish the two cases the
+model used to confuse:
+  - a file where a folder was expected  -> "use read_file"
+  - a folder where a file was expected  -> "use list_dir"
+
+Prompt support added in brain.py (FOLDERS AND PATHS section):
+  - never tell the user something does not exist until where_is has been called
+  - never guess or state WHERE something is
+  - never offer to create a folder you have not first failed to find
+
+That last line is aimed squarely at the reported bug.
+
+
+--------------------------------------------------------------------------------
+ S2-4. PATH KNOWLEDGE FOR EVERY AI  (your "accessible to every AI" request)
+--------------------------------------------------------------------------------
+
+Two new tools, both in the files category so they are widely reachable:
+
+  where_is(name)          resolves a spoken name to its real full path, or
+                          reports everywhere it looked
+  list_known_folders()    the real paths of project / desktop / documents /
+                          downloads / home
+
+Every consulted AI now receives the folder map automatically. All six ask_*
+tools (deepseek, llama, qwen, chatgpt, claude, gemini) funnel through
+_cloud_or_local, so a single injection point covers them all; ask_local_model
+bypasses that function and was patched separately. Each one now gets:
+
+  Real folder paths on this Windows PC (use these, never guess or assume
+  Documents):
+  project (Jarvis AI): C:\Users\Home\Desktop\AI\Jarvis AI
+  desktop: C:\Users\Home\Desktop
+  documents: C:\Users\Home\Documents
+  downloads: C:\Users\Home\Downloads
+  home: C:\Users\Home
+
+Claude Code gets the same map via --append-system-prompt on every invocation.
+
+
+--------------------------------------------------------------------------------
+ S2-5. NEW TOOLS: VS CODE + CLAUDE CODE
+--------------------------------------------------------------------------------
+
+Design decision (yours): CLI-driven, not GUI puppeteering. JARVIS does not type
+into VS Code's terminal. It calls the command-line tools directly, because blind
+keystrokes have no way to know when VS Code has finished loading and Claude
+Code's interactive TUI cannot be reliably scraped for output.
+
+  open_in_vscode(path="")        runs: code "<folder>"; defaults to the project
+  ask_claude_code(request,       runs: claude -p ... --permission-mode plan
+                  folder="")     READ-ONLY. Can read project, Desktop,
+                                 Documents and Downloads via --add-dir.
+                                 Deliberately NOT the whole home directory.
+  claude_code_edit(request,      runs: claude -p ... --permission-mode
+                   folder="")    acceptEdits. Writes stay scoped to the target
+                                 folder - no --add-dir. Two-turn gate, see S2-6.
+  cancel_claude_edit()           drops a pending edit
+  pending_edit()                 reports what is awaiting confirmation
+
+Engineering details worth remembering:
+
+  timeouts       CLAUDE_TIMEOUT = 300s. run_shell_command's 45s is far too
+                 short; a real Claude Code request took 142s in one measured run.
+  output cap     Claude's full answer goes to backend/data/claude_last.txt; the
+                 model receives only the first 1200 characters. server.py runs
+                 NUM_CTX = 2048, so an uncapped answer would blow the
+                 conversation context.
+  exe lookup     shutil.which first, then known install paths. uvicorn can start
+                 with a thinner PATH than your shell. Both binaries live in
+                 user-local folders:
+                   code   -> %LOCALAPPDATA%\Programs\Microsoft VS Code\bin\code.CMD
+                   claude -> %LOCALAPPDATA%\Microsoft\WinGet\Packages\...\claude.EXE
+  no shell       Both are invoked with an argument list, never shell=True, so
+                 folder names containing spaces need no quoting. Verified that
+                 Python can execute the .CMD shim directly.
+
+
+--------------------------------------------------------------------------------
+ S2-6. THE CONFIRMATION HOLE - FOUND BY TESTING, NOT BY READING
+--------------------------------------------------------------------------------
+
+This is the most important thing in this session.
+
+The first version followed the existing house pattern: a confirm bool parameter
+defaulting to False, exactly like delete_path and shutdown_pc. It was tested
+live and
+
+    IT EDITED memory.py WITHOUT ASKING.
+
+The model simply passed confirm=true on its very first call. A confirm parameter
+is not a safety gate when the model is the one filling it in. The file grew from
+3037 to 3067 bytes with an added "# Last updated: 2026-09-21" comment. That edit
+was reverted; memory.py is back to its original content and compiles.
+
+Note that delete_path, shutdown_pc, restart_pc, kill_process and
+empty_recycle_bin all still rely on exactly this pattern. They have not been
+changed, and they are therefore all bypassable the same way. That is a
+pre-existing hole, now demonstrated rather than theoretical.
+
+REPLACEMENT: a two-turn gate that the model does not control.
+
+  - confirm was REMOVED from the tool schema, so the model cannot supply it.
+    Any confirm kwarg it invents anyway is swallowed and ignored.
+  - brain.py calls tools.begin_turn(user_text) once per user message, which
+    defines a turn boundary.
+  - The first claude_code_edit call only ARMS the request and returns a message
+    for JARVIS to relay.
+  - It can only RUN on a LATER turn, and only if the user's own words in that
+    later turn were affirmative. An explicit refusal always wins, even in a
+    sentence that also contains "yes".
+
+Six attacks were run against it, all blocked:
+  1. confirm=True on the first call                -> armed only, did not run
+  2. two calls inside the same turn                -> armed only, did not run
+  3. later turn, user said something unrelated     -> kept waiting
+  4. later turn, user said no                      -> kept waiting
+  5. "yes but don't touch it"                      -> kept waiting
+  6. approval reused for a DIFFERENT request       -> re-armed, did not run
+And the happy path still opens: arm, then "yes go ahead" on the next turn
+reaches acceptEdits mode, and the pending request is cleared afterwards.
+
+
+--------------------------------------------------------------------------------
+ S2-7. WHAT IS NOT RELIABLE YET - READ THIS BEFORE USING THE EDIT PATH
+--------------------------------------------------------------------------------
+
+The SAFETY of the edit path is solid. The ROUTING to it is not.
+
+Measured, same command, five consecutive runs:
+    "ask claude code to create a file called guard_check.txt containing OK"
+    -> routed to claude_code_edit 3 times out of 5
+
+The two misses did not call any tool; JARVIS just talked. Across the whole
+session the same input produced three different behaviours on different runs:
+  - called claude_code_edit correctly
+  - called claude_code_edit with an invented compound path (now handled)
+  - called nothing and replied in prose
+
+Cause: qwen2.5:7b is simply not a strong enough tool-caller for a multi-turn,
+safety-gated flow. Everything single-shot and read-only is fine - the 22-case
+end-to-end suite passes 22/22, including open_in_vscode and ask_claude_code.
+
+Consequence for you: if you say "ask claude code to change X" and JARVIS just
+talks instead of asking you to confirm, say it again. It is not broken; the
+model dropped the tool call.
+
+PROPOSED FIX, NOT YET BUILT (needs your go-ahead): a deterministic pre-router.
+Detect "ask claude code to <verb> ..." in code, in brain.py, and invoke the tool
+directly instead of leaving the decision to the 7b model. Critical routing
+should not depend on model whim. This is a design change beyond what was agreed
+for this session, so it was deliberately left undone.
+
+UNEXPLAINED LOOSE END: in two of the five measured runs the tool was called and
+returned its arming message, yet the pending request read as empty afterwards.
+This could not be reproduced under instrumentation - when the tool is actually
+called, arming persisted every time. The gate fails CLOSED (no pending request
+means it refuses to run), so the worst case is having to repeat yourself.
+Flagging it rather than pretending to understand it.
+
+
+--------------------------------------------------------------------------------
+ S2-8. OTHER BUGS FIXED THIS SESSION
+--------------------------------------------------------------------------------
+
+ 1. Wrong opener chosen. "Open VS Code on the Jarvis AI folder" matched apps
+    ("open "), files ("folder") and devcode at once, putting open_app, open_path
+    and open_in_vscode all in scope. The model picked open_path, opened
+    Explorer, and then claimed it had opened VS Code. Fixed: when the editor is
+    named, the apps / files / window categories are dropped. Now 3 out of 3 live
+    runs use open_in_vscode.
+
+ 2. "ask claude code" collided with "ask claude". The ai category's "ask claude"
+    keyword matched too, and ai is pinned past the score margin, so ask_claude
+    (a LOCAL Ollama model, not Claude Code at all) was offered alongside
+    ask_claude_code. Fixed: the ai category is dropped outright when
+    "claude code" appears.
+
+ 3. Tool-call JSON leaked into speech. A reply contained the literal text
+    claude_code_edit followed by a JSON object. The existing patterns only
+    matched JSON with the tool name INSIDE the braces. Added a pattern for the
+    bare "toolname {json}" form.
+
+ 4. A bare "yes" fell out of scope. While an edit is armed the next message is
+    usually just "yes" or "no", which matches no keyword, so devcode dropped out
+    and the model wandered off into list_dir. Fixed: while an edit is pending,
+    devcode is pinned into scope and a bare yes/no is not treated as small talk.
+
+ 5. Prompt wording caused refusals. Describing ask_claude_code as "read-only"
+    next to the words "Claude Code" made the model announce "Claude Code is
+    read-only" and refuse edit requests entirely. The section was rewritten as
+    explicit routing rules: EXPLAIN/DESCRIBE/REVIEW -> ask_claude_code;
+    CREATE/ADD/WRITE/FIX/CHANGE/DELETE -> claude_code_edit; never refuse.
+
+ 6. Line endings. My patch scripts silently converted brain.py, server.py,
+    tools.py and memory.py from CRLF to LF. Harmless to Python but inconsistent
+    with the rest of the project. All six backend .py files were normalised back
+    to CRLF and re-verified to compile.
+
+
+--------------------------------------------------------------------------------
+ S2-9. FILES CHANGED IN SESSION 2
+--------------------------------------------------------------------------------
+
+MODIFIED
+  backend/tools.py      PROJECT_ROOT, alias overhaul, spacing-insensitive and
+                        compound path matching, path_not_found, better list_dir
+                        and read_file errors, folder map for every ask_* tool,
+                        5 new dev tools, two-turn confirmation gate
+  backend/brain.py      devcode category and keywords, opener disambiguation,
+                        ai-category suppression for "claude code", pending-edit
+                        pinning, FOLDERS AND PATHS + CLAUDE CODE prompt
+                        sections, begin_turn wiring, extra tool-JSON pattern
+  backend/memory.py     reverted the unauthorised Claude Code edit; CRLF restored
+  backend/selftest_tools.py   5 new cases incl. a confirm-guard assertion
+  backend/test_commands.py    5 new cases (22 total), docstring corrected to
+                        admit that the VS Code and Claude Code cases really do
+                        launch things
+  capability_report.txt, command_report.txt   regenerated
+
+BACKUPS
+  backend/tools.py.bak     pre-session-1 original
+  backend/tools.py.bak2    end of session 1, before the path work
+  backend/brain.py.bak     pre-session-1 original
+  backend/server.py.bak    pre-session-1 original
+  requirements.txt.bak     pre-session-1 original
+
+Tool counts: registry 83, schemas 83, categories 83. Zero drift in any
+direction.
+
+
+--------------------------------------------------------------------------------
+ S2-10. VERIFICATION - SESSION 2
+--------------------------------------------------------------------------------
+
+  All 6 backend .py files compile                  clean
+  registry / schemas / categories                  83 / 83 / 83, zero drift
+  Path resolution, 13 spoken variants              all correct
+  Direct tool execution (safe + desktop)           47 PASS, 3 FAIL
+                                                   (2x brightness = no DDC/CI,
+                                                    docker_ps = Docker not
+                                                    running; all environmental)
+  End-to-end command -> correct tool               22 PASS, 0 FAIL
+  "Open VS Code on the Jarvis AI folder" live      3/3 runs -> open_in_vscode
+  ask_claude_code live                             works; 13s, 33s and 142s
+                                                   measured on real requests
+  Confirmation gate, 6 adversarial attacks         6/6 blocked
+  Confirmation gate, happy path                    opens on genuine "yes"
+  claude_code_edit routing                         3/5 - NOT reliable, see S2-7
+  memory.py after all edit testing                 byte-identical to original
+
+Re-measure at any time:
+  cd "C:\Users\Home\Desktop\AI\Jarvis AI\backend"
+  ..\jarvis-env\Scripts\python.exe test_commands.py
+  ..\jarvis-env\Scripts\python.exe selftest_tools.py --desktop
+
+================================================================================
+ End of session 2.
+================================================================================
+
+
+================================================================================
+ SESSION 3 - 2026-09-21
+ Goal   : frontend only - settings to show/hide UI layers down to just the AI
+          core, plus a typed chat box alongside voice
+ Result : done and verified. 45 behavioural tests and 51 static checks pass.
+          ZERO backend changes; only backend/mobile.html was touched.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ S3-1. WHAT WAS ADDED
+--------------------------------------------------------------------------------
+
+A settings sheet, reachable two ways, with three layer toggles, a one-tap
+core-only preset, typeface choice and text size. Plus a message box so you can
+type instead of speaking.
+
+Chosen approach (your call): typed input only, no chat history persistence. The
+backend already accepts {"type":"user_message","content":"..."} on the existing
+WebSocket, so typing needed no server change at all and cannot break voice.
+
+
+--------------------------------------------------------------------------------
+ S3-2. THE LAYERS
+--------------------------------------------------------------------------------
+
+Each layer is driven by a data attribute on <body>, so one toggle hides a whole
+group with a single CSS rule and no class juggling.
+
+  data-text="off"      hides #chromeHeader (J.A.R.V.I.S. wordmark, MK-VII badge,
+                       connection status, clock) and #stateBlock (the IDLE /
+                       TAP CORE TO SPEAK labels)
+  data-chat="off"      hides #chatSection (transcript AND the message box)
+  data-mic="off"       hides #micMeters (EQ bars + VU meters) and #micBtn
+                       (the TAP TO SPEAK button)
+  data-coreonly="on"   set automatically when all three are off; centres the
+                       orb and dims the settings button to 25%
+
+IMPORTANT: hiding the mic controls does NOT disable voice. Tapping the orb
+starts listening - that handler is bound to #orb itself, not to the button. So
+core-only mode is still fully usable by voice.
+
+
+--------------------------------------------------------------------------------
+ S3-3. THE STRANDING TRAP, AND WHY THE GEAR IS WHERE IT IS
+--------------------------------------------------------------------------------
+
+The obvious implementation puts the settings button in the header. That would
+have been a one-way door: hiding the text layer removes the header, which
+removes the button, and you are stuck in core-only mode with no way back and no
+obvious recovery except clearing site data.
+
+So #gearBtn lives in its OWN fixed layer that no toggle can reach. It is
+positioned inside a fixed wrapper using the same max-w-md column as the header,
+so it lines up with the clock at every screen width instead of floating over it
+(the header's right-hand group gained pr-8 to keep clear of it).
+
+Second way in: HOLD the core for 600ms. Implemented with a pointerdown timer
+plus a suppressTap flag, because the release of a long press would otherwise
+also fire handleOrbTap and start the microphone.
+
+Both routes are covered by tests: "gear still displayed in core-only" and
+"gear is not inside a hidden layer".
+
+
+--------------------------------------------------------------------------------
+ S3-4. TYPOGRAPHY CONTROLS
+--------------------------------------------------------------------------------
+
+  Typeface   Space Grotesk (default) / JetBrains Mono / Inter
+             Applied via body[data-font="..."] rules that beat Tailwind's
+             .font-display / .font-body / .font-mono utilities on specificity,
+             so no !important anywhere. The Material Symbols icon class is
+             never targeted - restyling it would turn every icon into letters.
+
+  Text size  Small / Normal / Large via body[data-fs="s|m|l"].
+             NOTE: the layout uses hardcoded pixel sizes (text-[14px]), so
+             changing the root font size would have done absolutely nothing.
+             The rules instead target the text that carries meaning: transcript
+             bubbles, the state label, the hint line and the message box.
+             "Normal" is the existing design and deliberately has no rules.
+
+
+--------------------------------------------------------------------------------
+ S3-5. THE CHAT BOX AND THE SEND-PATH REFACTOR
+--------------------------------------------------------------------------------
+
+A text input and send button sit under the transcript. Enter sends; the button
+disables whenever the socket is not open.
+
+The one refactor worth knowing about: rec.onend used to inline its own
+addUser -> finalizeAssistant -> ws.send sequence. Typing would have needed a
+second copy of that, and the two would have drifted apart the first time either
+changed. Both now call a single sendMessage(text), which:
+
+  - ignores empty or whitespace-only input
+  - interrupts playback if JARVIS is mid-reply, exactly as tapping the core does
+  - renders the message, then sends it
+  - reports "Not connected. Message not sent." in the transcript instead of
+    silently swallowing the message when the socket is down
+
+A static check asserts there is now exactly ONE place in the file that sends a
+user_message, so the duplication cannot quietly come back.
+
+
+--------------------------------------------------------------------------------
+ S3-6. TESTING - AND A NOTE ON WHAT I COULD NOT DO
+--------------------------------------------------------------------------------
+
+I planned to drive this in a real Chrome via the browser extension and take
+screenshots. The extension was NOT connected, so that did not happen. No visual
+screenshot review was performed. Instead the page is tested two other ways, both
+saved in backend/ so you can re-run them:
+
+  verify_ui.py    51 static checks, needs nothing but Python.
+                  ..\jarvis-env\Scripts\python.exe verify_ui.py
+
+                  Cross-checks every getElementById against the real markup (a
+                  single typo there returns null, throws on first use, and kills
+                  the entire inline script - taking voice, chat and settings
+                  with it), every id used in CSS, every data-attribute the CSS
+                  reads against the ones the JS writes, that the gear is outside
+                  all hideable layers, and that localStorage is always guarded.
+
+  test_ui.js      45 behavioural tests in jsdom. Loads the REAL mobile.html,
+                  runs its actual inline script, and clicks the actual elements.
+                  Requires: npm install jsdom
+                  Then:     node test_ui.js
+
+                  Covers: defaults, sheet open/close by gear + backdrop +
+                  close button + Escape, each layer toggle independently, that
+                  two-of-three off is NOT core-only, that all three off IS,
+                  that core-only really computes display:none on the header,
+                  state labels, chat, meters and speak button while the orb
+                  stays visible, the preset in both directions with its label
+                  changing, typeface and size selection, localStorage round
+                  trip, and settings surviving a reload.
+                  For chat: whitespace-only is not sent, a real message goes out
+                  with the exact payload shape the backend expects, the input
+                  clears, the message renders, and the Enter key works.
+
+Also: node --check on the extracted script (syntax), and the live server was
+confirmed to serve the updated page.
+
+BUG FOUND BY THE TESTS: chatInput.scrollIntoView threw an uncaught TypeError.
+Some embedded webviews do not implement it, and an unguarded call leaves a
+console error for what is a purely cosmetic scroll. Now feature-detected with a
+fallback to the no-options form. This is exactly the class of bug static reading
+does not catch.
+
+
+--------------------------------------------------------------------------------
+ S3-7. DESIGN NOTES
+--------------------------------------------------------------------------------
+
+The existing gold Stark HUD was treated as fixed, not as something to redesign:
+same #ffc700 / #fff04d on #090a0f, same Space Grotesk / JetBrains Mono / Inter,
+same tracked uppercase mono labels. Only the new surfaces were designed.
+
+  - Bottom sheet rather than a centre modal: on a phone it arrives in thumb
+    reach, and sliding from the edge reads as a drawer over the HUD instead of a
+    page change.
+  - Toggles are real <button role="switch" aria-checked>, so they are keyboard
+    reachable and screen-reader correct, with visible focus rings.
+  - prefers-reduced-motion disables the sheet transition AND the orb's spin and
+    glow animations.
+  - Button copy names what will happen and keeps the same words in both
+    directions: "Show core only" / "Show everything".
+
+
+--------------------------------------------------------------------------------
+ S3-8. FILES CHANGED IN SESSION 3
+--------------------------------------------------------------------------------
+
+MODIFIED
+  backend/mobile.html        655 -> ~1005 lines. CSS for layers, typeface,
+                             text size, sheet, toggles; markup for the gear,
+                             sheet and composer; JS for settings persistence,
+                             the unified send path and hold-to-open.
+
+ADDED
+  backend/verify_ui.py       51 static checks (Python only)
+  backend/test_ui.js         45 behavioural tests (needs npm install jsdom)
+
+BACKUP
+  backend/mobile.html.bak    the original 655-line version
+
+NOT TOUCHED
+  server.py, brain.py, tools.py, memory.py - no backend change was needed.
+
+Settings are stored in localStorage under the key "jarvis.ui.v1". They are
+per-browser and per-device: your phone and your PC each keep their own. To reset
+to defaults, clear site data for the tunnel URL.
+
+
+--------------------------------------------------------------------------------
+ S3-9. VERIFICATION - SESSION 3
+--------------------------------------------------------------------------------
+
+  node --check on the extracted inline script      syntax OK
+  verify_ui.py static checks                       51 PASS, 0 FAIL
+  test_ui.js behavioural tests (jsdom)             45 PASS, 0 FAIL
+  core-only computes display:none on all 5 layers  confirmed
+  orb still visible in core-only                   confirmed
+  settings button reachable in core-only           confirmed
+  typed message payload matches backend contract   confirmed
+  settings survive a page reload                   confirmed
+  live server serves the updated page              confirmed
+  uncaught console errors                          none remaining
+  CRLF line endings preserved                      yes
+
+  NOT verified: real-device appearance. The Chrome extension was unavailable,
+  so nothing was checked visually on an actual phone screen. Worth a look on
+  your handset - particularly the sheet height with the Android keyboard open.
+
+================================================================================
+ End of session 3.
+================================================================================
+
+
+================================================================================
+ SESSION 4 - 2026-09-22
+ Goal   : (a) the Iron Man JARVIS voice
+          (b) speech that runs continuously instead of stopping between
+              sentences
+          (c) ChatGPT-voice-assistant style features
+ Result : (b) done and measured. (c) Phase 1 of 3 done: pace control by voice
+          and by slider, plus a second voice. (a) DECLINED - see S4-1.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ S4-1. THE ACTOR'S VOICE - WHAT I WOULD NOT DO, AND WHY
+--------------------------------------------------------------------------------
+
+The JARVIS voice in the films is Paul Bettany's performance. I did not help
+clone it. Cloning a specific, identifiable real person's voice is their likeness,
+and that is the line where a fan project becomes something else. This is not a
+capability gap - it was declined deliberately, and it will be declined again.
+
+What was done instead: chase the CHARACTER rather than the actor. A calm,
+measured British male delivery at a controllable pace gets most of the way
+there, and pace turned out to matter more than the model.
+
+
+--------------------------------------------------------------------------------
+ S4-2. VOICE RESEARCH - WHAT PIPER ACTUALLY OFFERS
+--------------------------------------------------------------------------------
+
+Searched the Piper voice catalogue. For en_GB it ships: alan (low, medium),
+northern_english_male (medium), alba, aru, cori (medium, high), jenny_dioco,
+semaine, southern_english_female.
+
+Only TWO of those are male: alan and northern_english_male. alan is the one
+described as strong and assertive, which is presumably why it was already
+chosen.
+
+So the honest finding: you were already on the best stock British male Piper
+voice. There was no better model to switch to.
+
+Downloaded anyway so you can judge by ear:
+  models/piper/en_GB-northern_english_male-medium.onnx       (63 MB)
+  models/piper/en_GB-northern_english_male-medium.onnx.json
+
+Worth knowing: despite the name, its espeak config is "en-gb-x-rp" - Received
+Pronunciation, not a northern accent. That is arguably CLOSER to the refined
+JARVIS register than the name suggests. Try it.
+
+A genuinely different voice would mean a different engine (Kokoro, XTTS), which
+is a much larger change and was not attempted.
+
+
+--------------------------------------------------------------------------------
+ S4-3. WHY THE SPEECH WAS STOPPING - IT WAS NEVER THE VOICE
+--------------------------------------------------------------------------------
+
+The gaps were in the TRANSPORT, not the model.
+
+  server.py synthesized one sentence at a time into a complete WAV, wrote it to
+  a TEMP FILE, read it back, base64'd it, deleted the file, and sent it.
+
+  mobile.html then did `new Audio(blobURL)` per chunk and waited for the
+  'ended' event before even constructing the next one.
+
+So every sentence boundary cost a fresh decode plus a fresh start - roughly
+50-200ms of silence - and the work was strictly serial: nothing decoded until
+the previous chunk had finished playing. If synthesis ever fell behind, the
+queue starved and the gap grew.
+
+FIXED IN TWO PLACES:
+
+ 1. server.py / speech.py - the WAV is now built in an in-memory buffer. The
+    temp file write, read and delete per sentence was pure latency on the one
+    path that is supposed to sound continuous.
+
+ 2. mobile.html - replaced the <audio>-element queue with a Web Audio graph.
+    Each chunk is decoded AS IT ARRIVES (in parallel with playback, not after
+    it) and scheduled on the audio clock at exactly the sample where the
+    previous chunk ends:
+
+        if (nextStartAt < now + 0.02) nextStartAt = now + LOOKAHEAD;
+        src.start(nextStartAt);
+        nextStartAt += buffer.duration;     // sample-accurate butt join
+
+    A 0.12s lookahead absorbs network jitter before the first chunk.
+
+MEASURED, not assumed: test_audio.js schedules three chunks of different
+lengths and asserts each starts exactly where the previous ended. Worst
+deviation across the run was under one millisecond.
+
+Interrupt handling needed care. A chunk can still be decoding when you tap to
+interrupt, and it would otherwise arrive afterwards and start talking again. A
+`speechGen` counter is bumped on every interrupt and stale chunks are dropped.
+There is a test for exactly that.
+
+A legacy <audio> path is kept for any browser without Web Audio. It has the old
+gaps, but it works.
+
+
+--------------------------------------------------------------------------------
+ S4-4. SPEAKING PACE - "TALK FASTER" / "SLOW DOWN"
+--------------------------------------------------------------------------------
+
+New backend/speech.py owns the voices and the pace. It was split out of
+server.py specifically so tools.py can change speech at runtime without
+importing the web server, which would be circular.
+
+The one design decision worth remembering: Piper's knob is `length_scale`,
+where HIGHER means SLOWER. That is backwards from what a person means. So the
+controller exposes RATE, where higher means faster, and does the reciprocal
+conversion (length_scale = 1 / rate) in exactly one place.
+
+  rate range   0.6 to 1.7, step 0.15 per nudge, default 1.0
+  below 0.6    Piper slurs; above 1.7 it is hard to follow
+
+MEASURED on the same sentence:
+  rate 0.7 -> 5.25s of audio
+  rate 1.0 -> 3.85s
+  rate 1.4 -> 3.01s
+Synthesis itself runs about 18x realtime after the model is loaded, which is
+why starvation is not a practical concern.
+
+Three ways to change it:
+  - say "talk faster", "slow down", "speak normally"  -> set_speech_pace tool
+  - drag the Speaking pace slider in the settings sheet
+  - the model can set an explicit rate, e.g. 1.3
+
+NOTE: pace and voice are SERVER state, not per-device like the UI layer
+settings. Every connected device hears the same voice at the same pace, which is
+correct - the synthesis happens on the PC.
+
+
+--------------------------------------------------------------------------------
+ S4-5. NEW TOOLS AND TRANSPORT
+--------------------------------------------------------------------------------
+
+Tools (registry / schemas / categories now 87 / 87 / 87, zero drift):
+  set_speech_pace(direction, rate)   faster / slower / normal, or an exact rate
+  get_speech_pace()                  report the current pace
+  set_voice(name)                    switch installed voice
+  list_voices()                      what is installed, and which is active
+
+New "speech" gating category. One keyword decision worth noting: bare "voice"
+is in the list, because no other category uses that word, so any mention of a
+voice reaches these tools. Verified that "switch to the northern voice" and
+"speak normally" both route correctly - neither did on the first attempt.
+
+WebSocket protocol additions (server.py). The socket previously ignored every
+message that was not a user_message:
+  -> {"type":"set_rate","value":1.3}          client to server
+  -> {"type":"set_voice","name":"alan"}       client to server
+  -> {"type":"get_speech_config"}             client to server
+  <- {"type":"speech_config", voice, voices, rate, rate_min, rate_max}
+Sent unprompted on connect, so the phone's slider and voice buttons are correct
+before you touch anything. Changing voice or pace never requires reconnecting.
+
+Piper is also now warmed up at startup (log line "[warmup] voice 'alan' ready").
+The first synthesis takes seconds while the ONNX model loads, and that delay
+used to land in the middle of your first reply.
+
+
+--------------------------------------------------------------------------------
+ S4-6. WHAT WAS NOT BUILT - PHASES 2 AND 3
+--------------------------------------------------------------------------------
+
+You chose Phase 1 only. These remain open, by agreement:
+
+PHASE 2 - hands-free conversation
+  Continuous listen loop so you stop tapping the core, and true voice barge-in.
+
+  The barge-in problem is real and is already in your Notes as bug 9: the mic is
+  hard-muted while JARVIS speaks ON PURPOSE, because the phone's mic hears the
+  phone's speaker and JARVIS transcribes itself in a loop. Echo cancellation
+  usually fails on speakerphone. Barge-in works reliably WITH HEADPHONES.
+
+  I did not want to ship hands-free barge-in on a bare phone speaker and hand
+  you an echo loop. Tap-to-interrupt already works, and now cancels in-flight
+  audio chunks correctly too.
+
+PHASE 3 - spoken web search
+  Your current web_search only opens a Chrome tab on the PC; it never reads
+  results back, which is useless over voice. Needs a fetch-and-summarize tool.
+  No search API key is set here, so it would likely need a keyless endpoint
+  (DuckDuckGo HTML or similar), which can be rate-limited or break without
+  notice.
+
+Already working, no change needed: memory (remember_fact and friends), and
+mobile plus desktop access - any browser on the tunnel URL.
+
+
+--------------------------------------------------------------------------------
+ S4-7. FILES CHANGED IN SESSION 4
+--------------------------------------------------------------------------------
+
+ADDED
+  backend/speech.py        SpeechController: voice discovery, voice switching,
+                           rate control, in-memory WAV synthesis
+  backend/test_audio.js    19 gapless-scheduling and speech-control tests
+                           (needs npm install jsdom)
+  models/piper/en_GB-northern_english_male-medium.onnx{,.json}
+
+MODIFIED
+  backend/server.py        uses the speech controller instead of loading Piper
+                           itself; hardcoded voice paths removed; in-memory
+                           synthesis; WS control messages; voice warmup
+  backend/tools.py         speech bridge (register_speech, with a lazy import
+                           fallback so the test harnesses work standalone) and
+                           the 4 speech tools
+  backend/brain.py         speech category, keywords, prompt guidance
+  backend/mobile.html      Web Audio gapless engine, pace slider, voice picker
+  backend/selftest_tools.py  6 cases for the tools the harness reported as
+                           untested, including pace and voice round-trips
+  backend/test_commands.py   3 speech cases (25 total)
+
+BACKUPS
+  backend/server.py.bak2, backend/tools.py.bak3, backend/mobile.html.bak2
+  (plus the session 1-3 .bak files)
+
+
+--------------------------------------------------------------------------------
+ S4-8. VERIFICATION - SESSION 4
+--------------------------------------------------------------------------------
+
+  All Python modules compile                       clean
+  registry / schemas / categories                  87 / 87 / 87, zero drift
+  node --check on the inline script                syntax OK
+  verify_ui.py static checks                       54 PASS, 0 FAIL
+  test_audio.js gapless + controls                 19 PASS, 0 FAIL
+    worst chunk-to-chunk scheduling deviation      under 1 ms
+    stale chunk dropped after interrupt            confirmed
+  test_ui.js (session 3 regression check)          45 PASS, 0 FAIL
+  selftest_tools.py direct tool execution          42 PASS, 1 FAIL
+                                                   (docker_ps only - Docker is
+                                                   not running; environmental)
+  test_commands.py end-to-end routing              25 PASS, 0 FAIL
+  pace measured server-side, same sentence         5.25s / 3.85s / 3.01s
+  live WS: speech_config on connect                confirmed
+  live WS: set_rate 1.0 -> 1.6                     3.42s -> 2.38s audio
+  live WS: set_voice                               switched, chunks still arrive
+  voice-command routing, rate actually moved       1.15 / 0.85 / 1.00
+
+  NOT verified: how it SOUNDS. There is no audio output available here, and the
+  Chrome extension is still not connected, so gaplessness is proven numerically
+  and not by ear. Listen on your phone; if you still hear a seam between
+  sentences, it is a different cause and worth telling me.
+
+Re-run any of it:
+  cd "C:\Users\Home\Desktop\AI\Jarvis AI\backend"
+  ..\jarvis-env\Scripts\python.exe verify_ui.py
+  ..\jarvis-env\Scripts\python.exe selftest_tools.py
+  ..\jarvis-env\Scripts\python.exe test_commands.py
+  node test_audio.js        (npm install jsdom first)
+  node test_ui.js
+
+================================================================================
+ End of session 4.
+================================================================================
+
+
+================================================================================
+ SESSION 5 - 2026-09-22
+ Goal   : Phase 2 - hands-free conversation. Keep listening after each reply,
+          and allow interrupting by voice.
+ Result : done. 31 new behavioural tests pass, no regressions in the other
+          three suites. Two real pre-existing bugs found and fixed along the
+          way - see S5-2 and S5-3, they matter more than the feature.
+          FRONTEND ONLY: server.py, tools.py, brain.py untouched this session.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ S5-1. HOW HANDS-FREE WORKS
+--------------------------------------------------------------------------------
+
+Two new settings in the sheet, both OFF by default because they change how the
+whole thing behaves:
+
+  Hands-free          keeps listening after each reply, no tapping
+  Interrupt by voice  leaves the mic open while JARVIS speaks (barge-in)
+
+THE CRITICAL DESIGN POINT: rec.continuous STAYS false.
+
+Setting continuous = true is the obvious way to get a continuous mic and it is
+exactly what caused Notes bug 10 - Chrome on Android duplicates the transcript
+exponentially ("hellohellohello"). So instead, recognition is RE-ARMED manually
+after each turn. That gives the continuous feel without reintroducing the bug.
+
+Re-arming is deliberately not triggered by the 'idle' state alone. Idle arrives
+when the model finishes, but audio chunks are still draining on the phone, so
+re-arming there would open the mic while JARVIS was still talking. The trigger
+is settleIfDone() - every scheduled chunk finished AND nothing left decoding -
+plus a 450ms breath.
+
+  scheduleRearm() refuses to fire unless: hands-free on, not paused, not muted,
+  not already listening, no audio busy, state is idle, socket open.
+
+BOUNDED SILENCE: after MAX_QUIET_ROUNDS (4) consecutive listens that heard
+nothing, hands-free PAUSES itself and the hint changes to
+"TAP TO RESUME HANDS-FREE". An open mic that re-arms forever drains the battery
+and never tells you it has given up. A tap brings it back.
+
+
+--------------------------------------------------------------------------------
+ S5-2. PRE-EXISTING BUG FOUND: INTERRUPTING DID NOT ACTUALLY STOP THE REPLY
+--------------------------------------------------------------------------------
+
+Found while reading the code to plan barge-in, not by testing.
+
+stopSpeaking() only discarded the audio ALREADY QUEUED. The server keeps
+streaming the rest of that reply's sentences, so the next chunk to arrive was
+happily scheduled and JARVIS carried on talking a moment later.
+
+This affected TAP-TO-INTERRUPT, which has existed since before this session. If
+you ever tapped the core to shut JARVIS up and it resumed a second later, that
+was this.
+
+FIX: a turn-scoped audio gate.
+  acceptAudio starts true, is set false by interruptSpeech(), and is set true
+  again only when a new user message is sent. enqueueAudio() drops everything
+  while it is false.
+
+interruptSpeech() is now used by the tap handler, the typed-message path and
+barge-in, so all three genuinely silence the remainder of the reply.
+
+Tested: "audio sent after an interrupt is dropped, not played", and
+"a new turn accepts audio again".
+
+
+--------------------------------------------------------------------------------
+ S5-3. PRE-EXISTING BUG FOUND: THE "RETRY ONCE" RETRY WAS UNBOUNDED
+--------------------------------------------------------------------------------
+
+rec.onend has an auto-retry for a fast empty result, guarded by retriedThisTap
+so it only happens once. But:
+
+    rec.onstart = () => { retriedThisTap = false; };
+
+cleared the guard on every start, including the retry's own start. So
+startListening's `if (!isRetry) retriedThisTap = false;` was pointless, and a
+mic that kept ending instantly-empty would retry forever, throttled only by the
+180ms delay.
+
+Harmless-ish before. NOT harmless with hands-free: the retry branch returns
+BEFORE the quiet-round counter can increment, so the loop could never reach
+MAX_QUIET_ROUNDS and never pause. Hands-free would have spun indefinitely.
+
+FIX: rec.onstart no longer touches the flag. startListening already sets it
+correctly for a fresh start only. The retry is now genuinely once, after which
+the empty result falls through to the quiet-round counter.
+
+This is why the bounded-silence test passes at all.
+
+
+--------------------------------------------------------------------------------
+ S5-4. BARGE-IN AND THE ECHO GUARD
+--------------------------------------------------------------------------------
+
+The honest problem, already logged as Notes bug 9: the phone's mic hears the
+phone's speaker. Leave the mic open while JARVIS talks and JARVIS transcribes
+itself, interrupts itself, and loops.
+
+Barge-in is therefore OFF by default, and the row in the settings sheet says
+plainly: "Best with headphones. On a speaker JARVIS may hear itself."
+
+Three gates before any speech heard during playback is believed to be the user:
+
+ 1. barge-in must be explicitly enabled (and hands-free on)
+ 2. at least BARGE_MIN_WORDS (2) words - a click or a cough is not an interrupt
+ 3. looksLikeEcho() must be false
+
+looksLikeEcho() keeps a rolling 500-character window of what JARVIS is currently
+saying (fed from appendToken) and compares the heard words against it. If 70% or
+more of the heard words (longer than 2 characters) appear in what JARVIS just
+said, it is treated as echo and ignored.
+
+THIS IS A MITIGATION, NOT A FIX. It cannot catch a paraphrase or a
+badly-degraded echo, and it will occasionally reject a genuine interruption that
+happens to repeat JARVIS's own words back. Headphones remain the real answer.
+
+Tested, and these three are the tests worth keeping:
+  - ECHO of JARVIS's own words does not interrupt
+  - a single word does not interrupt
+  - real speech interrupts playback
+
+When barge-in is OFF, the old behaviour is untouched: the mic is aborted the
+moment the speaking state arrives.
+
+
+--------------------------------------------------------------------------------
+ S5-5. SMALLER THINGS
+--------------------------------------------------------------------------------
+
+ - The state hint is now computed by refreshHint() in one place instead of being
+   duplicated inside setState, because it now depends on hands-free and
+   barge-in as well as the state:
+     listening  -> JUST SPEAK            (hands-free) / TAP TO SEND NOW
+     speaking   -> SPEAK TO INTERRUPT    (barge-in)   / TAP TO INTERRUPT
+     idle       -> HANDS-FREE - LISTENING / TAP TO RESUME HANDS-FREE /
+                   TAP CORE TO SPEAK
+
+ - Mic permission denial now clears any pending re-arm timer, so hands-free
+   cannot keep firing at a mic that will never open. The message also changed
+   from a fake user bubble - addUser("(mic permission denied)") pretended YOU
+   said that - to logNotice(), which says "Microphone permission denied. Typing
+   still works."
+
+ - Barge-in shows up in the transcript as a TOOL line reading "interrupted", so
+   you can see in the log where you cut in.
+
+ - The barge-in settings row dims to 45% opacity while hands-free is off, since
+   it does nothing on its own.
+
+
+--------------------------------------------------------------------------------
+ S5-6. FILES CHANGED IN SESSION 5
+--------------------------------------------------------------------------------
+
+MODIFIED
+  backend/mobile.html   hands-free engine (scheduleRearm, quiet rounds, pause
+                        and resume), barge-in with the echo guard, the
+                        acceptAudio turn gate, refreshHint, the onstart retry
+                        fix, two new settings toggles and their markup
+
+ADDED
+  backend/test_handsfree.js   31 behavioural tests (needs npm install jsdom)
+
+BACKUP
+  backend/mobile.html.bak3    the state at the end of session 4
+
+NOT TOUCHED
+  server.py, tools.py, brain.py, speech.py, memory.py - Phase 2 is entirely
+  client-side. Nothing about the voice path on the server changed.
+
+
+--------------------------------------------------------------------------------
+ S5-7. VERIFICATION - SESSION 5
+--------------------------------------------------------------------------------
+
+  node --check on the inline script                syntax OK
+  verify_ui.py static checks                       56 PASS, 0 FAIL
+  test_handsfree.js                                31 PASS, 0 FAIL
+  test_audio.js      (session 4 regression)        19 PASS, 0 FAIL
+  test_ui.js         (session 3 regression)        45 PASS, 0 FAIL
+  live server serves the hands-free build          confirmed
+  live WS turn still works                         get_time, 1 audio chunk,
+                                                   correct spoken reply
+
+  NOT verified, and this one needs you:
+  Everything above is jsdom with a STUBBED SpeechRecognition and a stubbed
+  AudioContext. No real microphone, no real speaker, no real echo path was
+  involved. The echo guard is proven to reject text that matches JARVIS's own
+  words; it is NOT proven to survive a real room with a real speaker.
+
+  What to try on your phone, in this order:
+   1. Hands-free ON, barge-in OFF, no headphones. This should be solid.
+   2. Hands-free ON, barge-in ON, WITH headphones. Should let you cut in.
+   3. Hands-free ON, barge-in ON, on the speaker. Expect trouble; this is the
+      configuration I cannot make reliable. If JARVIS starts talking to itself,
+      turn barge-in off - that is the known limitation, not a new bug.
+
+Re-run:
+  cd "C:\Users\Home\Desktop\AI\Jarvis AI\backend"
+  node test_handsfree.js        (npm install jsdom first)
+  node test_audio.js
+  node test_ui.js
+  ..\jarvis-env\Scripts\python.exe verify_ui.py
+
+Phase 3 (spoken web search) remains unbuilt.
+
+================================================================================
+ End of session 5.
+================================================================================
+
+
+================================================================================
+ SESSION 6 - 2026-09-22
+ Goal   : Phase 3 - spoken web search. Results read back aloud instead of a
+          browser tab opening on the PC.
+ Result : done, with a hard limitation you should know about (S6-1). The
+          important work turned out to be stopping JARVIS inventing citations
+          (S6-3) - it was doing that 4 times out of 4.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ S6-1. WHAT SEARCH IS ACTUALLY POSSIBLE HERE - PROBED, NOT ASSUMED
+--------------------------------------------------------------------------------
+
+Four keyless endpoints were tested from this machine before any code:
+
+  DuckDuckGo Instant Answer API   WORKS. Official, keyless, fast (0.3s).
+                                  Only answers encyclopedic questions. Returned
+                                  NOTHING for "python asyncio gather", "best
+                                  coffee shops in cebu city", and even for
+                                  "capital of France".
+
+  Wikipedia search + REST summary WORKS. Official, keyless, reliable. It is an
+                                  encyclopedia, not the web. The REST summary
+                                  endpoint needs an EXACT title (plain
+                                  "Asyncio" 404s), so the search step cannot be
+                                  skipped.
+
+  duckduckgo.com/html             BLOCKED. Returns HTTP 202 with a bot
+                                  challenge.
+
+  lite.duckduckgo.com/lite        BLOCKED. Serves a CAPTCHA - literally
+                                  "Select all squares containing a duck".
+
+So: THERE IS NO RELIABLE KEYLESS GENERAL WEB SEARCH from this machine. Scraping
+DuckDuckGo is not an option and defeating a CAPTCHA was not attempted.
+
+What was built instead is honest about that. web_answer tries, in order:
+  1. Brave Search API    real general web search - ONLY if BRAVE_API_KEY is set
+  2. DuckDuckGo Instant Answer
+  3. Wikipedia search + summary
+and says plainly when none of them answered, including a hint about the key.
+
+The Brave slot follows the same pattern the ask_chatgpt / ask_claude tools
+already use: cloud is used only if a key exists, and nothing breaks without one.
+If you ever set BRAVE_API_KEY, real web search starts working with no code
+change. That is the upgrade path.
+
+
+--------------------------------------------------------------------------------
+ S6-2. THE TOOLS
+--------------------------------------------------------------------------------
+
+  web_answer(query)     fetches and condenses so the answer can be SPOKEN
+  search_sources()      reports which backends are usable right now
+  web_search(query)     UNCHANGED - still opens a browser tab on the PC
+
+The schema descriptions were rewritten to make the split unmistakable, because
+the model has to choose between them:
+  web_search  "OPEN a browser tab on the PC. The user cannot hear these."
+  web_answer  "get a short answer you can READ ALOUD."
+
+Output limits, chosen deliberately:
+  220 chars per result, 900 chars total. server.py runs NUM_CTX = 2048, so a
+  long dump would blow the context - and a tool has no business pasting long
+  passages of someone else's text into the model either. Full results go to
+  backend/data/last_search.txt.
+
+
+--------------------------------------------------------------------------------
+ S6-3. THE REAL PROBLEM: INVENTED CITATIONS
+--------------------------------------------------------------------------------
+
+With the tool built and correctly offered by the gating, end-to-end testing gave
+0 out of 4. The model called NO tool and answered from memory, every time
+fabricating a source:
+
+  "who is the prime minister of japan"
+     -> "According to Wikipedia, as of my last update, Japan's Prime Minister
+         is Fumio Kishida."     (stale - he left office in 2024 - AND the
+                                 citation was invented)
+  "what is the population of tokyo"
+     -> "According to data from recent web sources, ..."   (there were none)
+  "how many moons does mars have"
+     -> "According to NASA, ..."                           (never contacted)
+  "look up the capital of france"
+     -> "According to Wikipedia, ... Paris."   (right answer, fake citation)
+
+Note the irony: telling the model in the prompt to NAME ITS SOURCE taught it to
+imitate citation format. It learned the phrasing, not the behaviour.
+
+Prompt rules did not fix this. That is now twice that prompt discipline has
+failed on tool routing with qwen2.5:7b - 3/5 on claude_code_edit in session 2,
+0/4 here.
+
+FIX, APPROVED BY YOU: a deterministic pre-router in brain.py.
+
+  When gating has already concluded that the ONLY applicable tools are the
+  spoken-web ones, brain.py calls web_answer ITSELF before generating, and hands
+  the result to the model framed as "answer ONLY from this text and name its
+  source". The model's remaining job is to say it. It cannot skip the lookup,
+  because the lookup already happened.
+
+  Scope is deliberately narrow - the guard is
+      "web_answer" in names and names <= {"web_answer", "search_sources"}
+  so if anything local also applies, the model still decides. Local routing was
+  regression-checked: get_time, get_clipboard, list_dir, get_weather and
+  system_info all still win their own questions.
+
+  The lookup text is kept OUT of the persisted conversation (it is appended to a
+  throwaway copy of the message list) so a 2048-token context is not permanently
+  padded with search results.
+
+AFTER: 4 of 4 call the tool, and the citations are true because the fetch really
+happened.
+
+
+--------------------------------------------------------------------------------
+ S6-4. TWO MORE THINGS THE TESTS CAUGHT
+--------------------------------------------------------------------------------
+
+ 1. WIKIPEDIA SEARCH IS POISONED BY QUESTION WORDS.
+    My own selftest failed on "what is the capital of France" after the same
+    question had worked minutes earlier. The cause was worth finding:
+
+      "what is the capital of France" -> Wikipedia returned "Closed-ended
+          question" and "What Is a Nation?" - it matched on the words "What Is".
+          Relevance 0.00.
+      "capital of France"            -> "List of capitals of France".
+          Relevance 1.00.
+
+    Wikipedia's search matches the literal phrase. So _search_query() now strips
+    the interrogative preamble before searching: "who is the prime minister of
+    japan" -> "prime minister of japan", "jarvis, can you please look up the
+    population of tokyo" -> "the population of tokyo". It never strips a query
+    down to nothing.
+
+    Wikipedia's own result ordering is also not relevance for this purpose - it
+    offered "Capital punishment in France" next to "List of capitals of France" -
+    so three candidates are fetched and re-ranked by term overlap.
+
+    After the fix: "how many moons does mars have" returns "Moons of Mars - The
+    two moons of Mars are Phobos and Deimos."
+
+ 2. RELEVANCE GUARD, to stop the TOOL fabricating.
+    Wikipedia always returns something. Before the guard, "python asyncio
+    gather" came back as "According to Wikipedia: Coroutine ..." - a confident,
+    unrelated article that JARVIS would have read out as the answer. That is the
+    same disease as the model inventing a file listing, only with the tool
+    supplying the plausible wrong content.
+
+    _relevance() measures how many of the query's meaningful words appear in the
+    result. Below WEAK_MATCH (0.34) the tool says so explicitly: "I did not find
+    a direct answer to X. The closest thing Wikipedia has is ... this may not be
+    what they asked for."
+
+    Known limit it does NOT solve: "best coffee shops in cebu city" scores as
+    relevant (coffee, cebu, city all match) and returns a Wikipedia article about
+    a coffee chain founded in Cebu. It is topically related but it is not a
+    ranked list of the best shops. Judging that needs real web search.
+
+
+--------------------------------------------------------------------------------
+ S6-5. PRE-EXISTING BUG FIXED: EVERY REPLY WAS STORED TWICE
+--------------------------------------------------------------------------------
+
+Found while mapping the control flow for the pre-router.
+
+brain.stream_with_tools() appends the assistant reply to the message list it was
+given. server.py then did:
+
+    conversation.append({"role": "assistant", "content": cleaned_final})
+
+on that SAME list. So every assistant turn went into the history twice. With
+HISTORY_TURNS = 5 that meant roughly half the context window was duplicate text,
+and the model was being fed its own words twice - the exact opposite of what all
+the anti-repetition work in session 1 was for.
+
+FIX: server.py now overwrites brain's entry with its cleaned version rather than
+appending a second copy.
+
+
+--------------------------------------------------------------------------------
+ S6-6. FILES CHANGED IN SESSION 6
+--------------------------------------------------------------------------------
+
+MODIFIED
+  backend/tools.py      web_answer, search_sources, the three source backends,
+                        _relevance guard, _search_query normalisation,
+                        Wikipedia re-ranking, urllib.parse import
+  backend/brain.py      forced_lookup pre-router + LOOKUP_FRAME, world-fact rule
+                        in GROUND TRUTH, "never invent an attribution" rule,
+                        _is_world_question, spoken-web narrowing in
+                        _schemas_for, web keywords, LOOKING THINGS UP prompt
+  backend/server.py     duplicate assistant-turn append fixed
+  backend/selftest_tools.py   2 web cases, including a nonsense query that must
+                        fail honestly
+  backend/test_commands.py    5 web cases (30 total)
+
+BACKUPS
+  backend/tools.py.bak4, backend/brain.py.bak2, backend/server.py.bak3
+
+Tool counts: registry 89, schemas 89, categories 89. Zero drift.
+
+
+--------------------------------------------------------------------------------
+ S6-7. VERIFICATION - SESSION 6
+--------------------------------------------------------------------------------
+
+  All Python modules compile                       clean
+  registry / schemas / categories                  89 / 89 / 89, zero drift
+  web_answer, 5 query types                        factual answered, technical
+                                                   weak-flagged, nonsense failed
+                                                   honestly
+  query normalisation, 8 phrasings                 all correct
+  local-tool regression (6 questions)              get_time, get_clipboard,
+                                                   list_dir, get_weather,
+                                                   system_info, hello - all OK
+  world-question routing BEFORE the pre-router     0 of 4  (all fabricated)
+  world-question routing AFTER                     4 of 4  (all grounded)
+  selftest_tools.py                                44 PASS, 1 FAIL (docker only)
+  test_commands.py end-to-end                      30 PASS, 0 FAIL
+  verify_ui.py                                     56 PASS
+  test_ui.js / test_audio.js / test_handsfree.js   45 / 19 / 31, no regressions
+  live WS: "how many moons does mars have"         web_answer + TTS audio,
+                                                   "According to Wikipedia,
+                                                   Mars has two moons."
+  live WS: "what time is it"                       still get_time
+
+  WHAT IS STILL WEAK, honestly:
+   - No general web search without BRAVE_API_KEY. Technical questions ("python
+     asyncio gather") and local recommendations ("best coffee shops") cannot be
+     answered properly. They are flagged rather than faked, which is the best
+     available behaviour, not a good one.
+   - The pre-router only covers world questions. The claude_code_edit routing
+     from session 2 is still 3/5; you chose not to extend the pre-router to it.
+   - Answers are as current as Wikipedia and DuckDuckGo's abstracts. For genuine
+     news, a key is required.
+
+All three phases of the voice-assistant work are now done:
+  Phase 1  gapless speech + pace control        session 4
+  Phase 2  hands-free + barge-in                session 5
+  Phase 3  spoken web search                    session 6
+
+================================================================================
+ End of session 6.
+================================================================================

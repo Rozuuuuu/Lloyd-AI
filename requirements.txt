@@ -1,0 +1,25 @@
+# Core: LLM client, web server, websocket transport
+ollama
+fastapi
+uvicorn[standard]
+websockets
+python-dotenv
+
+# Text to speech (Piper, British male voice in models/piper/)
+piper-tts
+sounddevice
+soundfile
+numpy
+
+# --- PC control. Without these, roughly half of tools.py silently fails
+# --- with "not installed" at runtime. Added 2026-09-21.
+psutil                      # system_info, battery_status, top_processes, list_running_apps
+pyautogui                   # type_text, press_key, press_hotkey, mouse, scroll, volume, media keys
+pyperclip                   # get_clipboard, set_clipboard
+pillow                      # take_screenshot
+screen-brightness-control    # brightness_up / brightness_down
+send2trash                  # delete_path (Recycle Bin instead of permanent delete)
+requests                    # cloud AI fallbacks (ask_chatgpt / ask_claude / ask_gemini)
+
+# Speech recognition on the PC itself is NOT used -- the phone's Web Speech API
+# is the microphone. SpeechRecognition and pyaudio are no longer required.

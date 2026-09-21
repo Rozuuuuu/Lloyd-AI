@@ -1,0 +1,289 @@
+# JARVIS AI — Complete Project Handoff
+
+## 🎯 Project Overview
+
+A **voice-controlled AI assistant** named JARVIS (Iron Man style) that runs entirely on a local Windows PC and is accessed from a mobile phone via browser. It can control the PC, remember the user, and consult other AI models.
+
+**Owner's setup:**
+- Windows PC, 16GB RAM, **no microphone**
+- Uses mobile phone (Chrome on Android) as mic + speaker
+- PC runs the entire AI stack (Ollama, backend, TTS)
+- Cloudflare tunnel bridges phone → PC
+
+---
+
+## 🏗️ Architecture
+
+```
+📱 Phone (Chrome)          💻 PC (Windows)
+  - Mic (Web Speech API)     - FastAPI + WebSocket server
+  - Speaker (Piper TTS)  ↔   - Ollama (local LLMs)
+  - UI (gold HUD)            - Python tools (PC control)
+                             - SQLite memory
+                             - Cloudflare tunnel → public HTTPS URL
+```
+
+**Data flow:**
+1. Tap orb on phone → Chrome's Web Speech API captures speech → text
+2. Text sent over WebSocket to PC backend
+3. Qwen2.5 (via Ollama) decides: reply directly OR call a tool
+4. Reply streamed back token-by-token → displayed on phone
+5. Piper TTS synthesizes speech → base64 WAV → phone plays it
+6. Mic auto-rearms after Jarvis stops speaking
+
+---
+
+## 📁 File Structure
+
+```
+C:\Users\Home\Desktop\AI\Jarvis AI\
+├── backend/
+│   ├── server.py          # FastAPI + WebSocket server (port 8000)
+│   ├── brain.py           # LLM reasoning + tool gating + dedup
+│   ├── tools.py           # All PC-control + memory + external AI tools
+│   ├── memory.py          # SQLite per-session chat history + user facts
+│   ├── mobile.html        # The phone UI (gold JARVIS HUD)
+│   └── data/
+│       └── jarvis_memory.db   # SQLite database (auto-created)
+├── models/
+│   ├── piper/en_GB-alan-medium.onnx{,.json}   # TTS voice (British male)
+│   └── vosk/                                  # (unused now — Web Speech API instead)
+└── venv/                  # Python 3.12 virtual environment
+```
+
+---
+
+## 🧩 Component Details
+
+### `server.py` (FastAPI backend)
+- **Port 8000**, bound to `0.0.0.0` so tunnel can reach it
+- **WebSocket endpoint** `/ws/voice` — main comms channel
+- **REST endpoints**: `/` (serves mobile.html), `/health`, `/model` (switch model)
+- **Streams LLM tokens** to phone in real time
+- **Streaming TTS**: synthesizes each sentence as it completes (not the whole reply)
+- **List-awareness**: detects bullet lines and skips reading them aloud
+- **Warmup**: pre-loads Ollama model on startup (`keep_alive="30m"`)
+- **Config at top**: `MODEL_NAME = "qwen2.5:7b"`, `NUM_CTX = 2048`, `HISTORY_TURNS = 5`
+
+### `brain.py` (LLM reasoning)
+- **Model**: `qwen2.5:7b` (switched from `llama3.2:3b` → `qwen2.5:14b` → `qwen2.5:7b` for speed/RAM balance)
+- **System prompt** enforces:
+  - Anti-repetition rules (never restate the question)
+  - Tool usage discipline (call tools, don't describe them)
+  - Memory: auto-call `remember_fact` on any personal detail
+  - Formatting: bullets (`•`) for lists, max 15 items
+- **Category-based tool gating** (`TOOL_CATEGORY`, `CATEGORY_KEYWORDS`):
+  - Only exposes relevant tools per user message → prevents hallucination
+  - Example: "hello" → 0 tools. "list my desktop" → files tools only
+- **Special phrase forcing**: `"list my X"` → files tools only (fixes "list my desktop" collision with window tool)
+- **Deduplication**: `dedupe_reply()` strips duplicate sentences + echoes of user input
+- **Anti-repetition**: `repeat_penalty: 1.15` in Ollama options
+- **Streaming with tools**: `stream_with_tools()` handles multi-turn tool execution (max 4 rounds)
+- **Response cleaning**: strips `{"name":..., "parameters":...}` JSON leaks and foreign-script garbage
+
+### `tools.py` (PC control — 70+ tools)
+Organized into categories (each category has its own keyword triggers in `brain.py`):
+
+| Category | Tools |
+|---|---|
+| **files** | `run_shell_command`, `read_file`, `write_file`, `list_dir`, `create_folder`, `move_path`, `copy_path`, `delete_path`, `find_files`, `grep_files`, `open_path`, `zip_path`, `unzip_path`, `get_time` |
+| **info** | `system_info`, `battery_status`, `top_processes` |
+| **power** | `lock_screen`, `sleep_pc`, `shutdown_pc`, `restart_pc`, `abort_shutdown` |
+| **audio** | `volume_up`, `volume_down`, `mute_toggle` |
+| **screen** | `take_screenshot`, `brightness_up`, `brightness_down` |
+| **apps** | `open_app`, `close_app`, `list_running_apps`, `list_installed_apps`, `kill_process` |
+| **window** | `show_desktop`, `switch_window`, `minimize_window`, `maximize_window`, `close_window` |
+| **input** | `type_text`, `press_key`, `press_hotkey`, `move_mouse`, `click_mouse`, `scroll_screen` |
+| **web** | `open_url`, `web_search`, `youtube_search` (uses `os.startfile` → reuses existing Chrome) |
+| **media** | `media_play_pause`, `media_next`, `media_previous` |
+| **clipboard** | `get_clipboard`, `set_clipboard` |
+| **python** | `run_python` |
+| **notify** | `send_notification`, `set_timer` |
+| **network** | `ping_host`, `get_ip`, `check_port`, `flush_dns` |
+| **weather** | `get_weather` (uses wttr.in, no key) |
+| **dev** | `git_status`, `docker_ps` |
+| **recycle** | `empty_recycle_bin` |
+| **env** | `get_env`, `set_env` |
+| **memory** | `remember_fact`, `forget_fact`, `list_user_facts` |
+| **ai** | `ask_deepseek`, `ask_llama`, `ask_qwen`, `ask_chatgpt`, `ask_claude`, `ask_gemini`, `ask_local_model`, `list_available_ais` |
+
+**Path handling**: `resolve_path()` turns "my desktop" → real OneDrive-aware Desktop path (`C:\Users\Home\OneDrive\Desktop`). Handles `desktop`, `documents`, `downloads`, `home` aliases.
+
+**External AI tools now work WITHOUT API keys** — they call local Ollama models:
+- `ask_deepseek` → runs local `deepseek-r1:8b`
+- `ask_llama` → runs local `llama3.2:3b`
+- `ask_qwen` → runs local `qwen2.5:7b`
+- Cloud fallbacks (ChatGPT, Claude, Gemini) work only if key set, not required
+
+**Safety**: destructive tools (`delete_path`, `kill_process`, `shutdown_pc`, `restart_pc`, `empty_recycle_bin`) require `confirm=true` — Jarvis asks first.
+
+### `memory.py` (SQLite persistence)
+- **Conversations table**: per-session chat history (session_id, role, content)
+- **Facts table**: user info (key, value, category)
+- **Categories**: `identity`, `preference`, `project`, `context`, `general`
+- **Auto-migration**: adds missing columns to old DBs
+- **Injected into system prompt** on every new session so Jarvis "remembers" you
+
+### `mobile.html` (phone UI)
+- **Gold HUD** theme (Space Grotesk + JetBrains Mono fonts, gold/amber palette)
+- **Single-tap control**: one tap on the orb → listen, tap again → send, tap while speaking → interrupt
+- **Chrome-Android STT fixes**:
+  - `continuous = false` (true breaks on Android — duplicates text exponentially)
+  - Only `pointerup` listener (single event per tap; prevents double-fire)
+  - 500ms debounce + 400ms cooldown after entering listening
+  - Mic primed via `getUserMedia` on first gesture (fixes silent first-tap)
+- **Half-duplex audio**: mic hard-muted while Jarvis is speaking (prevents echo loop)
+- **Visuals**: rotating gold rings, canvas particles, EQ bars, VU meters, live transcript
+- **State display**: IDLE / LISTENING / PROCESSING / SPEAKING
+
+---
+
+## 🐛 Bugs Fixed (chronological)
+
+1. **`ModuleNotFoundError: vosk`** → installed, then switched to Web Speech API
+2. **Piper path errors** → absolute paths in server config
+3. **`wave.Error: # channels not specified`** → use `synthesize_wav()` for piper-tts 1.2.x
+4. **`Failed to create a model` (Vosk)** → wrong folder structure, eventually abandoned Vosk
+5. **No mic on PC** → switched to phone browser as mic source
+6. **Cloudflare "scatter games" page** → restart tunnel for fresh URL
+7. **Slow first response** → `keep_alive="30m"` + warmup on startup
+8. **AI hallucinating `{"name":"hello","parameters":{}}`** → switched from llama3.2:3b to qwen2.5:14b, added category gating + `clean_tool_json()`
+9. **Jarvis interrupts itself** → half-duplex gating (`jarvisSpeaking` flag blocks mic)
+10. **Speech-to-text duplicating** ("hellohellohello") → `continuous = false` + rebuild transcript from index 0
+11. **"list my desktop"** → triggered both files + window categories; fixed by moving "desktop" keyword to files, added `_FILES_PHRASES` forcing files-only
+12. **Thai/CJK garbage in output** → `clean_hallucination()` strips non-Latin scripts
+13. **`WinError 10061` (Ollama not running)** → launch Ollama app
+14. **PC crash** → likely RAM pressure from 14b model; switched to 7b
+15. **Redundant output** → `repeat_penalty=1.15` + `dedupe_reply()`
+16. **`NameError: ping_host not defined`** → functions must be defined before `TOOL_REGISTRY` (they were pasted after)
+
+---
+
+## 🚀 Startup Procedure
+
+**Prerequisites:**
+```bash
+pip install ollama fastapi uvicorn websockets SpeechRecognition pyaudio piper-tts sounddevice soundfile numpy psutil pyautogui pyperclip pillow screen-brightness-control send2trash
+ollama pull qwen2.5:7b
+```
+
+**Three terminals:**
+
+```powershell
+# Terminal 1 — Ollama (usually auto-runs as service)
+ollama serve
+
+# Terminal 2 — Backend
+cd "C:\Users\Home\Desktop\AI\Jarvis AI\backend"
+uvicorn server:app --host 0.0.0.0 --port 8000
+
+# Terminal 3 — Cloudflare tunnel
+cloudflared tunnel --url http://localhost:8000
+```
+
+Copy the `*.trycloudflare.com` URL → open on phone in **Chrome**.
+
+---
+
+## 📋 Full Command Reference
+
+**Time/Info:** "what time is it", "battery", "system info", "top processes"
+
+**Files:** "list my desktop", "list documents", "read notes.txt", "create folder X", "find PDFs", "grep TODO", "zip folder", "move X to Y", "delete X" (confirm)
+
+**Power:** "lock screen", "sleep", "shut down" (confirm), "restart" (confirm), "abort shutdown", "empty recycle bin" (confirm)
+
+**Audio/Screen:** "volume up/down", "mute", "screenshot", "dim screen", "brighten screen"
+
+**Apps:** "open Notepad/Chrome/VS Code/Spotify", "close Chrome", "what apps are running", "installed apps", "kill process X"
+
+**Windows:** "show desktop", "switch window", "minimize/maximize/close window"
+
+**Input:** "type 'hello'", "press Enter", "press Ctrl+S", "click at 500,300", "scroll down"
+
+**Web:** "search Google for X", "search YouTube for Y", "open github.com"
+
+**Media:** "play", "pause", "next track", "previous track"
+
+**Clipboard:** "what's in my clipboard", "copy 'text' to clipboard"
+
+**Python:** "run Python: print(2+2)"
+
+**Timers:** "set a timer for 5 minutes", "notify me to X"
+
+**Network:** "ping google.com", "what's my IP", "is port 8000 open", "flush DNS"
+
+**Weather:** "what's the weather", "weather in Tokyo"
+
+**Dev:** "git status", "what Docker containers are running"
+
+**Env:** "what's JAVA_HOME", "set MY_VAR to hello"
+
+**Memory:** "my name is Tony" (auto-saves), "what do you know about me", "forget my name"
+
+**External AI:** "ask deepseek X", "ask llama X", "ask qwen X", "list available AIs", "ask local model llama3.2:3b X"
+
+**Chat (no tool):** "hello", "how are you", "tell me a joke", "thanks"
+
+---
+
+## ⚙️ Current Model & Performance
+
+- **Active model**: `qwen2.5:7b` (~4.7GB)
+- **Response time**: 2-4s typical, ~5-15s for external AI calls
+- **RAM headroom**: ~10GB free on the PC (after switching off 14b)
+- **The PC previously crashed** likely from RAM pressure running `qwen2.5:14b` (9GB) — do **not** switch back to 14b on this hardware
+
+---
+
+## 🎨 Frontend Design Language
+
+- **Aesthetic**: Stark Industries gold holographic HUD
+- **Colors**: `#ffc700` (gold), `#fff04d` (bright yellow), `#0f1016` (near-black bg)
+- **Fonts**: Space Grotesk (headers), JetBrains Mono (labels), Inter (body)
+- **Elements**: rotating concentric rings, glowing core, particle canvas, EQ bars, VU meters, live transcript bubbles
+- **States drive animation speed**: idle (slow) → listening (medium) → thinking (fast) → speaking (fastest)
+
+---
+
+## 🔧 Known Quirks & Gotchas
+
+1. **Cloudflare quick tunnel URL changes every restart** — must re-copy to phone
+2. **Ollama sometimes dies silently** — relaunch from Start menu, verify with `ollama list`
+3. **Chrome Android SpeechRecognition** is unreliable with `continuous=true` — must stay `false`
+4. **Piper voice files** must be at `models/piper/en_GB-alan-medium.onnx{,.json}`
+5. **`curl` in PowerShell** aliases to `Invoke-WebRequest` — use `curl.exe` instead
+6. **Windows Controlled Folder Access** may block Python from writing to Desktop — add `python.exe` to allowlist
+7. **`NameError` on tool functions** — all tool functions must be defined BEFORE `TOOL_REGISTRY = {...}` in tools.py
+8. **List formatting** — Jarvis uses `•` bullets on screen but does NOT read them aloud (TTS filters them via `is_list_item()` in server.py)
+
+---
+
+## 📌 What's Next (potential upgrades)
+
+- Scheduled tasks / recurring reminders
+- Email sending (SMTP)
+- Calendar integration (Google Calendar API)
+- Vision (screenshot → multimodal model)
+- Wake word detection (always-on listening)
+- Named Cloudflare tunnel (fixed URL — requires domain)
+- Home Assistant integration
+- Spotify Web API for music control
+
+---
+
+## 🔑 Key Environment Variables (optional)
+
+Only set if you want cloud AI fallbacks (not needed for local AI):
+```powershell
+setx DEEPSEEK_API_KEY "..."
+setx OPENAI_API_KEY "..."
+setx ANTHROPIC_API_KEY "..."
+setx GEMINI_API_KEY "..."
+```
+
+The system works **100% offline** without any of these.
+
+---
+
+That's the complete state. Any AI reading this should be able to pick up development, debug issues, or extend functionality.
