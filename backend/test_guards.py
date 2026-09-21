@@ -206,6 +206,66 @@ tools.shutdown_pc()
 ok("a cancelled action cannot be resurrected by a later yes",
    not acted(), ACTED)
 
+# ------------------------------------------------- replay is not a bypass
+# replay_pending() guarantees the tool gets CALLED. It must not grant consent:
+# the gate inside the tool is still the only thing that authorises the action.
+reset()
+tools.begin_turn("shut down the pc")
+tools.shutdown_pc()
+tools.begin_turn("what time is it")
+tools.replay_pending()
+ok("replay on a non-affirmative turn does not act", not acted(), ACTED)
+
+reset()
+tools.begin_turn("shut down the pc")
+tools.shutdown_pc()
+tools.begin_turn("no dont")
+tools.replay_pending()
+ok("replay on an explicit no does not act", not acted(), ACTED)
+
+reset()
+tools.begin_turn("shut down the pc")
+tools.shutdown_pc()
+tools.replay_pending()                      # same turn as arming
+ok("replay in the arming turn does not act", not acted(), ACTED)
+
+reset()
+tools.begin_turn("shut down the pc")
+tools.shutdown_pc()
+tools.begin_turn("yes go ahead")
+tools.replay_pending()
+ok("replay after a genuine yes does act", acted(), "never acted")
+
+# ------------------------------------------------- stale pending expires
+# Once replay exists, an action left armed turns ANY later yes - including a yes
+# to an unrelated question - into a trigger. It must time out.
+reset()
+tools.begin_turn("shut down the pc")
+tools.shutdown_pc()
+for filler in ("what time is it", "list my desktop", "hello"):
+    tools.begin_turn(filler)
+    tools.pending_action()
+ok("still armed within the TTL", tools._PENDING is not None)
+tools.begin_turn("yes go ahead")
+tools.pending_action()
+ok("armed action expires after PENDING_TTL_TURNS", tools._PENDING is None)
+del ACTED[:]
+tools.replay_pending()
+ok("an expired action cannot be fired by a late yes", not acted(), ACTED)
+
+# ------------------------------------------------- refusal clears it outright
+reset()
+tools.begin_turn("delete that file")
+tools.delete_path(TMPFILE)
+ok("armed before the refusal", tools._PENDING is not None)
+tools.begin_turn("no dont do that")
+tools.cancel_pending_action()
+ok("cancel_pending_action clears the slot", tools._PENDING is None)
+del ACTED[:]
+tools.begin_turn("yes go ahead")
+tools.delete_path(TMPFILE)
+ok("a refused action is not revived by a later yes", not acted(), ACTED)
+
 # ---------------------------------------------------------------- teardown
 tools.subprocess.run = _real_run
 import shutil

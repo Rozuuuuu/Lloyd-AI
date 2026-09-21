@@ -514,6 +514,110 @@ def forced_lookup(user_text: str, schemas):
         return "The web lookup failed: %s" % e
 
 
+# ---------- PRE-ROUTER: CLAUDE CODE EDITS ----------
+# Measured 3 of 5. When the model missed, nothing armed and the user simply got
+# prose - so a request to change code silently did nothing.
+#
+# Arming through the pre-router is safe: the FIRST call to claude_code_edit only
+# arms and cannot edit anything. And the two-turn gate still lives inside the
+# tool, so pre-routing guarantees the tool is CALLED without granting consent.
+_EDIT_VERBS = (
+    "add", "create", "write", "make", "fix", "change", "update", "refactor",
+    "rename", "delete", "remove", "implement", "replace", "insert", "append",
+    "modify", "move", "clean", "tidy", "wire", "hook", "extract", "split",
+    "rewrite", "convert", "bump", "patch",
+)
+
+# "ask claude code to X", "tell claude code to X", "have claude code X"
+_EDIT_ASK = re.compile(
+    r"(?:ask|tell|get|have|let)\s+claude\s*code\s+(?:to\s+)?(.+)$", re.IGNORECASE)
+_EDIT_DIRECT = re.compile(
+    r"^\s*claude\s*code[,:]?\s+(?:please\s+)?(.+)$", re.IGNORECASE)
+
+
+def edit_request(user_text: str):
+    """Extract a CHANGE request aimed at Claude Code, or None.
+
+    Questions are deliberately excluded: "ask claude code what memory.py does"
+    routes to ask_claude_code, which the model already gets right every time.
+    Only an instruction whose first word is an editing verb qualifies.
+    """
+    s = (user_text or "").strip()
+    if "claude code" not in s.lower() and "claudecode" not in s.lower():
+        return None
+    m = _EDIT_ASK.search(s) or _EDIT_DIRECT.match(s)
+    if not m:
+        return None
+    req = m.group(1).strip().strip("?.!").strip()
+    if not req:
+        return None
+    first = re.split(r"[^a-zA-Z]+", req.lower(), maxsplit=1)[0]
+    if first not in _EDIT_VERBS:
+        return None
+    return req
+
+
+def forced_edit(user_text: str, schemas):
+    """Arm a Claude Code edit deterministically. Returns the message to relay."""
+    names = {s["function"]["name"] for s in schemas}
+    if "claude_code_edit" not in names:
+        return None
+    req = edit_request(user_text)
+    if not req:
+        return None
+    try:
+        return TOOL_REGISTRY["claude_code_edit"](request=req)
+    except Exception as e:
+        return "Could not prepare that edit: %s" % e
+
+
+def forced_cancel(user_text: str):
+    """Clear an armed action when the user refuses.
+
+    Found in testing: the model would SAY "action cancelled" while the request
+    stayed armed. Harmless before replay_pending existed; afterwards a later
+    "yes" - to any question at all - would have fired the stale action.
+    """
+    if getattr(_tools, "_PENDING", None) is None:
+        return None
+    try:
+        if not _tools._user_said_no():
+            return None
+        return _tools.cancel_pending_action()
+    except Exception:
+        return None
+
+
+def forced_confirm(user_text: str):
+    """Finish an armed action when the user has just said yes.
+
+    Without this, turn two still depended on the model calling the tool again -
+    so a "yes" could silently do nothing while the user believed they had
+    approved it. The gate inside the tool still checks consent independently.
+    """
+    if getattr(_tools, "_PENDING", None) is None:
+        return None
+    try:
+        if not _tools._user_said_yes():
+            return None
+        return _tools.replay_pending()
+    except Exception:
+        return None
+
+
+EDIT_FRAME = (
+    "A Claude Code edit has been ARMED but NOT yet performed. Relay the status "
+    "below to the user as a short question and wait for their answer. Do not "
+    "say anything has been changed yet.\n\nSTATUS:\n"
+)
+
+DONE_FRAME = (
+    "The user confirmed, and the action has now been carried out. Report the "
+    "result below in one or two short sentences. Do not offer to do it "
+    "again.\n\nRESULT:\n"
+)
+
+
 LOOKUP_FRAME = (
     "A web lookup was just performed for the user's question. Answer ONLY from "
     "the text below and name its source. Do not add facts from memory. If it "
@@ -650,13 +754,42 @@ class JarvisBrain:
         # thing that could apply. Kept OUT of `messages` so the conversation
         # history is not permanently padded with search text - NUM_CTX is 2048.
         lookup_note = None
-        if schemas:
+
+        # 1a. The user refused. Clear the armed action for real, so no later
+        #     "yes" can resurrect it.
+        cancelled = forced_cancel(user_text)
+        if cancelled:
+            yield ("tool", "cancelled")
+            schemas = []
+            lookup_note = {"role": "system", "content": DONE_FRAME + str(cancelled)}
+
+        # 1b. The user is answering a pending confirmation. This takes priority
+        #    over everything else: they are not starting a new request.
+        confirmed = None if cancelled else forced_confirm(user_text)
+        if confirmed:
+            what, output = confirmed
+            yield ("tool", "confirmed")
+            schemas = []
+            lookup_note = {"role": "system",
+                           "content": DONE_FRAME + str(output)}
+
+        # 2. A world question with one applicable tool: look it up now.
+        elif schemas and not cancelled:
             result = forced_lookup(user_text, schemas)
             if result:
                 yield ("tool", "web_answer")
                 schemas = []
                 lookup_note = {"role": "system",
                                "content": LOOKUP_FRAME + str(result)}
+            else:
+                # 3. An instruction to change code: arm it now. Arming cannot
+                #    edit anything, so this is safe to do without asking first.
+                armed = forced_edit(user_text, schemas)
+                if armed:
+                    yield ("tool", "claude_code_edit")
+                    schemas = []
+                    lookup_note = {"role": "system",
+                                   "content": EDIT_FRAME + str(armed)}
 
         while rounds <= max_tool_rounds:
             use_schemas = schemas if rounds < max_tool_rounds else []

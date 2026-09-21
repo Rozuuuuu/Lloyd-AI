@@ -1928,3 +1928,190 @@ WHAT IS STILL OPEN
 ================================================================================
  End of session 7.
 ================================================================================
+
+
+================================================================================
+ SESSION 8 - 2026-09-22
+ Goal   : extend the deterministic pre-router to the Claude Code edit path,
+          which measured 3 of 5.
+ Result : 5 of 5. But adding it introduced a real safety bug that testing
+          caught - read S8-3, it is the important part of this session.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ S8-1. WHY PRE-ROUTING AN EDIT IS SAFE
+--------------------------------------------------------------------------------
+
+Worth stating plainly, because it looks alarming at first glance.
+
+For web_answer the pre-router simply RAN the tool, which was fine - it is
+read-only. For claude_code_edit two things make it equally safe:
+
+ 1. The FIRST call only ARMS the request. It cannot edit anything. So the
+    pre-router arming an edit has no destructive effect at all.
+ 2. The two-turn gate lives INSIDE the tool and is re-evaluated on every call.
+    The pre-router guarantees the tool is CALLED; it does not grant consent.
+    Consent is still checked independently by _confirm_gate, which requires a
+    LATER turn and the user's own affirmative words.
+
+There are now explicit tests for exactly that distinction: replay on a
+non-affirmative turn, on an explicit no, and in the arming turn all refuse to
+act; only a genuine yes on a later turn acts.
+
+
+--------------------------------------------------------------------------------
+ S8-2. THE TWO HALVES
+--------------------------------------------------------------------------------
+
+ARMING (brain.forced_edit)
+  edit_request() extracts a CHANGE instruction aimed at Claude Code:
+    "ask claude code to add a git branch tool"   -> "add a git branch tool"
+    "tell claude code to fix the brightness bug" -> "fix the brightness bug"
+    "have claude code refactor tools.py"         -> "refactor tools.py"
+    "claude code, add a comment to memory.py"    -> "add a comment to memory.py"
+
+  Questions are deliberately excluded, because ask_claude_code already routes
+  correctly every time and must not be hijacked:
+    "ask claude code what memory.py does"        -> None
+    "ask claude code to explain the gating"      -> None
+    "ask claude to add something"                -> None  (not Claude CODE)
+
+  The test is that the first word of the extracted request is an editing verb
+  (add, fix, create, refactor, rename, delete, ...), not a question word.
+
+REPLAY (brain.forced_confirm -> tools.replay_pending)
+  Arming alone was not enough. Turn two still depended on the model calling the
+  tool again with the same request, so a "yes" could silently do nothing while
+  the user believed they had approved it.
+
+  _confirm_gate now records the tool name and kwargs of the armed call, and
+  replay_pending() re-invokes exactly that. This generalises for free: a
+  confirmed shutdown, delete, kill or recycle-bin empty now completes reliably
+  too, not just a Claude Code edit.
+
+MEASURED, same command, five runs, comparable to session 2's measurement:
+    routed to claude_code_edit and armed:  5/5   (was 3/5)
+
+
+--------------------------------------------------------------------------------
+ S8-3. THE BUG I INTRODUCED, AND CAUGHT
+--------------------------------------------------------------------------------
+
+This is the part to remember.
+
+Testing the refusal path showed:
+
+    YOU:    no, dont do that
+      tools=-   pending=True         <-- STILL ARMED
+    JARVIS: Action cancelled. No changes have been made to your files.
+
+JARVIS said cancelled. The action was still armed.
+
+Before replay_pending existed this was untidy but harmless: the model had to
+call the tool again with the same request, which it rarely did. AFTER replay,
+any later "yes" - including a yes to a completely unrelated question, such as
+"shall I open VS Code?" - would have fired the stale armed action.
+
+So adding reliability to the confirm flow created a new way to trigger something
+the user had already refused. Two fixes:
+
+ 1. brain.forced_cancel(). An explicit refusal now clears the armed slot for
+    real, deterministically, instead of relying on the model to mean it when it
+    says "cancelled".
+
+ 2. PENDING_TTL_TURNS = 3 in tools.py. An armed action expires after three
+    turns. Expiry is enforced wherever the pending slot is consulted
+    (_confirm_gate, replay_pending, pending_action), so a forgotten request
+    cannot lie in wait. Verified: armed, then three unrelated turns, then "yes
+    go ahead" - nothing pending, nothing acted.
+
+Both are covered by tests so they cannot regress.
+
+
+--------------------------------------------------------------------------------
+ S8-4. PRE-ROUTER PRIORITY ORDER
+--------------------------------------------------------------------------------
+
+In brain.stream_with_tools, before the model generates anything:
+
+  1a. refusal      -> clear the armed action           (tool event "cancelled")
+  1b. confirmation -> replay the armed action          (tool event "confirmed")
+  2.  world question with one applicable tool -> look it up  ("web_answer")
+  3.  an instruction to change code -> arm it          ("claude_code_edit")
+
+Refusal is checked before confirmation on purpose: "yes but actually don't"
+must land on the refusal branch. The result of whichever branch fires is handed
+to the model in a throwaway system message (EDIT_FRAME / DONE_FRAME /
+LOOKUP_FRAME) that is NOT persisted into the conversation, so a 2048-token
+context is not permanently padded.
+
+
+--------------------------------------------------------------------------------
+ S8-5. SMALL THINGS NOTICED, NOT FIXED
+--------------------------------------------------------------------------------
+
+ - The model embellishes the LOCATION when relaying an arming message. Asked to
+   create a file with no path given, it said "on your Desktop" when the tool's
+   working folder is the project root. The tool's own message names the folder
+   correctly; the model paraphrased it wrong. Cosmetic, but it is the same
+   invention instinct seen throughout.
+
+ - A bare "yes" with nothing pending makes the model flounder and leak
+   tool-speak ("please provide me with the details for which function you would
+   like to call"). Harmless, and a bare yes with no context genuinely is
+   ambiguous.
+
+
+--------------------------------------------------------------------------------
+ S8-6. FILES CHANGED IN SESSION 8
+--------------------------------------------------------------------------------
+
+MODIFIED
+  backend/tools.py        _confirm_gate records tool+args; replay_pending();
+                          _user_said_no(); PENDING_TTL_TURNS expiry enforced in
+                          three places; all six gates pass their replay args
+  backend/brain.py        edit_request(), forced_edit(), forced_confirm(),
+                          forced_cancel(); EDIT_FRAME and DONE_FRAME; the
+                          four-branch pre-router priority order
+  backend/test_guards.py  73 cases now (was 63): replay-is-not-a-bypass,
+                          pending expiry, refusal clears the slot
+
+Tool counts: registry 89, schemas 89, categories 89. Zero drift.
+
+
+--------------------------------------------------------------------------------
+ S8-7. VERIFICATION - SESSION 8
+--------------------------------------------------------------------------------
+
+  All Python modules compile                       clean
+  registry / schemas / categories                  89 / 89 / 89, zero drift
+  edit_request extraction, 9 phrasings             all correct, questions
+                                                   correctly excluded
+  edit routing, 5 runs                             5/5 (was 3/5)
+  two-turn flow, approve                           arms, then runs once, and
+                                                   claude was invoked exactly
+                                                   once in acceptEdits mode
+  two-turn flow, refuse                            arms, then clears; claude
+                                                   never invoked
+  refuse then a later yes                          nothing armed, nothing ran
+  stale pending after 4 turns                      expired, late yes did nothing
+  test_guards.py                                   73 PASS, 0 FAIL
+  selftest_tools.py                                44 PASS, 1 FAIL (docker)
+  test_commands.py                                 30 PASS, 0 FAIL
+  verify_ui.py                                     56 PASS
+  test_ui.js / test_audio.js / test_handsfree.js   45 / 19 / 31
+
+  298 checks passing across seven suites. Only failure anywhere is docker_ps,
+  because Docker Desktop is not running.
+
+STILL OPEN
+  - Nothing verified on a real phone by ear or by touch. All frontend testing is
+    jsdom with a stubbed mic and speaker.
+  - No general web search without BRAVE_API_KEY.
+  - The Notes file still describes the old setup and points at the empty venv/.
+  - RAM sat around 84% with the 7b model only.
+
+================================================================================
+ End of session 8.
+================================================================================

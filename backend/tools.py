@@ -400,7 +400,8 @@ def delete_path(path: str, **_ignored) -> str:
     if not os.path.exists(full):
         return path_not_found(path)
     go, msg = _confirm_gate("delete:" + os.path.normpath(full).lower(),
-                            "move %s to the Recycle Bin" % full)
+                            "move %s to the Recycle Bin" % full,
+                            "delete_path", {"path": path})
     if not go:
         return msg
     try:
@@ -603,7 +604,8 @@ def shutdown_pc(delay_seconds: int = 20, **_ignored) -> str:
     # The delay is left out of the key so changing it between turns does not
     # silently re-arm instead of running.
     go, msg = _confirm_gate("shutdown",
-                            "shut this PC down in %d seconds" % delay)
+                            "shut this PC down in %d seconds" % delay,
+                            "shutdown_pc", {"delay_seconds": delay})
     if not go:
         return msg
     try:
@@ -624,7 +626,8 @@ def restart_pc(delay_seconds: int = 20, **_ignored) -> str:
         delay = max(5, min(300, int(delay_seconds or 20)))
     except (TypeError, ValueError):
         delay = 20
-    go, msg = _confirm_gate("restart", "restart this PC in %d seconds" % delay)
+    go, msg = _confirm_gate("restart", "restart this PC in %d seconds" % delay,
+                            "restart_pc", {"delay_seconds": delay})
     if not go:
         return msg
     try:
@@ -848,7 +851,8 @@ def kill_process(name: str, **_ignored) -> str:
     if not str(name or "").strip():
         return "Which process should I stop, sir?"
     go, msg = _confirm_gate("kill:" + str(name).strip().lower(),
-                            "force %s to close, losing anything unsaved" % name)
+                            "force %s to close, losing anything unsaved" % name,
+                            "kill_process", {"name": name})
     if not go:
         return msg
     try:
@@ -1246,7 +1250,8 @@ def docker_ps() -> str:
 def empty_recycle_bin(**_ignored) -> str:
     go, msg = _confirm_gate(
         "empty_recycle_bin",
-        "permanently empty the Recycle Bin, which cannot be undone")
+        "permanently empty the Recycle Bin, which cannot be undone",
+        "empty_recycle_bin", {})
     if not go:
         return msg
     try:
@@ -1755,6 +1760,28 @@ def begin_turn(user_text: str = "") -> None:
     _LAST_USER_TEXT = str(user_text or "")
 
 
+# An armed action must not linger. Once replay_pending() exists, a stale pending
+# request turns any later "yes" - even a yes to an unrelated question - into a
+# trigger for something the user has long since moved on from.
+PENDING_TTL_TURNS = 3
+
+
+def _user_said_no() -> bool:
+    s = _LAST_USER_TEXT.strip().lower()
+    return bool(s) and any(n in s for n in _NEGATIVE)
+
+
+def _pending_expired() -> bool:
+    return (_PENDING is not None
+            and (_TURN - _PENDING["turn"]) > PENDING_TTL_TURNS)
+
+
+def _drop_expired_pending() -> None:
+    global _PENDING
+    if _pending_expired():
+        _PENDING = None
+
+
 def _user_said_yes() -> bool:
     s = _LAST_USER_TEXT.strip().lower()
     if not s:
@@ -1765,13 +1792,16 @@ def _user_said_yes() -> bool:
     return any(a in s for a in _AFFIRMATIVE)
 
 
-def _confirm_gate(key: str, what: str):
+def _confirm_gate(key: str, what: str, tool: str = "", args: dict = None):
     """Returns (go_ahead, message_to_relay).
 
     `key` identifies the exact action, so approving one thing cannot authorise a
-    different one. `what` is phrased to be read aloud.
+    different one. `what` is phrased to be read aloud. `tool` and `args` record
+    how to re-invoke this exact call, so replay_pending() can finish the job
+    when the user says yes - see the pre-router note in brain.py.
     """
     global _PENDING
+    _drop_expired_pending()
     armed = (_PENDING is not None
              and _PENDING["key"] == key
              and _PENDING["turn"] < _TURN)
@@ -1785,13 +1815,39 @@ def _confirm_gate(key: str, what: str):
         return False, ("Still waiting for your go-ahead to %s. "
                        "Say yes to confirm, or no to cancel." % what)
 
-    _PENDING = {"key": key, "what": what, "turn": _TURN}
+    _PENDING = {"key": key, "what": what, "turn": _TURN,
+                "tool": tool, "args": dict(args or {})}
     return False, ("This will %s. Ask the user to confirm out loud, then call "
                    "this tool again." % what)
 
 
+def replay_pending():
+    """Re-invoke the armed call so a confirmed action actually completes.
+
+    This does NOT bypass the gate. The gate lives inside the tool and is
+    evaluated again on this call: it still requires a later turn AND the user's
+    own affirmative words. All this does is guarantee the tool gets CALLED,
+    which is the part the model was unreliable at.
+
+    Returns (what_was_done, tool_output), or None when nothing is armed.
+    """
+    _drop_expired_pending()
+    if not _PENDING:
+        return None
+    tool = _PENDING.get("tool")
+    if not tool or tool not in TOOL_REGISTRY:
+        return None
+    what = _PENDING.get("what", "that")
+    args = dict(_PENDING.get("args") or {})
+    try:
+        return what, TOOL_REGISTRY[tool](**args)
+    except Exception as e:
+        return what, "That failed: %s" % e
+
+
 def pending_action() -> str:
     """What destructive action, if any, is waiting for the user's go-ahead."""
+    _drop_expired_pending()
     if not _PENDING:
         return "Nothing is awaiting confirmation."
     return "Awaiting your confirmation to %s." % _PENDING["what"]
@@ -1821,7 +1877,8 @@ def claude_code_edit(request: str, folder: str = "", **_ignored) -> str:
 
     go, msg = _confirm_gate(
         "claude_edit:%s:%s" % (_squash(str(request)), os.path.normpath(target).lower()),
-        "let Claude Code edit files in %s" % target)
+        "let Claude Code edit files in %s" % target,
+        "claude_code_edit", {"request": request, "folder": folder})
     if not go:
         return msg
     # Writes stay scoped to the target folder - no --add-dir on purpose.
