@@ -395,12 +395,16 @@ def copy_path(src: str, dst: str) -> str:
         return f"Error: {e}"
 
 
-def delete_path(path: str, confirm: bool = False) -> str:
-    if not confirm:
-        return "SAFETY: delete requires confirm=true."
+def delete_path(path: str, **_ignored) -> str:
+    full = resolve_path(path)
+    if not os.path.exists(full):
+        return path_not_found(path)
+    go, msg = _confirm_gate("delete:" + os.path.normpath(full).lower(),
+                            "move %s to the Recycle Bin" % full)
+    if not go:
+        return msg
     try:
         from send2trash import send2trash
-        full = resolve_path(path)
         send2trash(full)
         return f"Sent to Recycle Bin: {full}"
     except Exception as e:
@@ -591,11 +595,18 @@ def sleep_pc() -> str:
         return f"Error: {e}"
 
 
-def shutdown_pc(confirm: bool = False, delay_seconds: int = 20) -> str:
-    if not confirm:
-        return "SAFETY: shutdown requires confirm=true."
+def shutdown_pc(delay_seconds: int = 20, **_ignored) -> str:
     try:
-        delay = max(5, min(300, delay_seconds))
+        delay = max(5, min(300, int(delay_seconds or 20)))
+    except (TypeError, ValueError):
+        delay = 20
+    # The delay is left out of the key so changing it between turns does not
+    # silently re-arm instead of running.
+    go, msg = _confirm_gate("shutdown",
+                            "shut this PC down in %d seconds" % delay)
+    if not go:
+        return msg
+    try:
         if IS_WINDOWS:
             subprocess.run(f"shutdown /s /t {delay}", shell=True)
         elif IS_MAC:
@@ -608,11 +619,15 @@ def shutdown_pc(confirm: bool = False, delay_seconds: int = 20) -> str:
         return f"Error: {e}"
 
 
-def restart_pc(confirm: bool = False, delay_seconds: int = 20) -> str:
-    if not confirm:
-        return "SAFETY: restart requires confirm=true."
+def restart_pc(delay_seconds: int = 20, **_ignored) -> str:
     try:
-        delay = max(5, min(300, delay_seconds))
+        delay = max(5, min(300, int(delay_seconds or 20)))
+    except (TypeError, ValueError):
+        delay = 20
+    go, msg = _confirm_gate("restart", "restart this PC in %d seconds" % delay)
+    if not go:
+        return msg
+    try:
         if IS_WINDOWS:
             subprocess.run(f"shutdown /r /t {delay}", shell=True)
         elif IS_MAC:
@@ -829,9 +844,13 @@ def list_installed_apps() -> str:
         return f"Error: {e}"
 
 
-def kill_process(name: str, confirm: bool = False) -> str:
-    if not confirm:
-        return "SAFETY: kill_process requires confirm=true."
+def kill_process(name: str, **_ignored) -> str:
+    if not str(name or "").strip():
+        return "Which process should I stop, sir?"
+    go, msg = _confirm_gate("kill:" + str(name).strip().lower(),
+                            "force %s to close, losing anything unsaved" % name)
+    if not go:
+        return msg
     try:
         if IS_WINDOWS:
             exe = name if name.lower().endswith(".exe") else name + ".exe"
@@ -1224,9 +1243,12 @@ def docker_ps() -> str:
 #  RECYCLE BIN
 # ============================================================
 
-def empty_recycle_bin(confirm: bool = False) -> str:
-    if not confirm:
-        return "SAFETY: empty_recycle_bin requires confirm=true."
+def empty_recycle_bin(**_ignored) -> str:
+    go, msg = _confirm_gate(
+        "empty_recycle_bin",
+        "permanently empty the Recycle Bin, which cannot be undone")
+    if not go:
+        return msg
     try:
         if IS_WINDOWS:
             subprocess.run(
@@ -1707,14 +1729,15 @@ def ask_claude_code(request: str, folder: str = "") -> str:
 
 
 # ---------- TWO-TURN CONFIRMATION ----------
-# A `confirm: bool` parameter is NOT a safety gate: the model fills it in, and
-# qwen2.5:7b simply passed confirm=true on the first call and edited a file
-# nobody had approved. The gate therefore lives here, outside the model's
-# control: an edit must be ARMED on one turn and can only RUN on a later turn,
-# and only when the user's own words in that later turn were affirmative.
+# A `confirm: bool` parameter is NOT a safety gate. The model fills it in, and
+# qwen2.5:7b was observed setting confirm=true on its very first call and
+# editing a file nobody had approved. Every destructive tool therefore routes
+# through _confirm_gate, which the model cannot satisfy on its own: the action
+# is ARMED on one turn and can only RUN on a LATER turn, and only when the
+# user's own words in that later turn were affirmative.
 _TURN = 0
 _LAST_USER_TEXT = ""
-_PENDING_EDIT = None   # {"key":..., "request":..., "folder":..., "turn":int}
+_PENDING = None            # {"key":..., "what":..., "turn":int}
 
 _AFFIRMATIVE = (
     "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm", "confirmed",
@@ -1736,28 +1759,59 @@ def _user_said_yes() -> bool:
     s = _LAST_USER_TEXT.strip().lower()
     if not s:
         return False
-    # An explicit refusal always wins, even if the sentence also contains "yes".
+    # An explicit refusal always wins, even in a sentence containing "yes".
     if any(n in s for n in _NEGATIVE):
         return False
     return any(a in s for a in _AFFIRMATIVE)
 
 
-def pending_edit() -> str:
-    """What edit, if any, is waiting for the user's go-ahead."""
-    if not _PENDING_EDIT:
-        return "No Claude Code edit is awaiting confirmation."
-    return (f"Awaiting confirmation to let Claude Code edit "
-            f"{_PENDING_EDIT['folder']}: {_PENDING_EDIT['request']}")
+def _confirm_gate(key: str, what: str):
+    """Returns (go_ahead, message_to_relay).
+
+    `key` identifies the exact action, so approving one thing cannot authorise a
+    different one. `what` is phrased to be read aloud.
+    """
+    global _PENDING
+    armed = (_PENDING is not None
+             and _PENDING["key"] == key
+             and _PENDING["turn"] < _TURN)
+
+    if armed and _user_said_yes():
+        _PENDING = None
+        return True, ""
+
+    if armed:
+        # Armed, but this turn was not a yes. Keep waiting; do not act.
+        return False, ("Still waiting for your go-ahead to %s. "
+                       "Say yes to confirm, or no to cancel." % what)
+
+    _PENDING = {"key": key, "what": what, "turn": _TURN}
+    return False, ("This will %s. Ask the user to confirm out loud, then call "
+                   "this tool again." % what)
+
+
+def pending_action() -> str:
+    """What destructive action, if any, is waiting for the user's go-ahead."""
+    if not _PENDING:
+        return "Nothing is awaiting confirmation."
+    return "Awaiting your confirmation to %s." % _PENDING["what"]
+
+
+def cancel_pending_action() -> str:
+    """Drop whatever is waiting for confirmation."""
+    global _PENDING
+    if not _PENDING:
+        return "There was nothing waiting for confirmation."
+    what = _PENDING["what"]
+    _PENDING = None
+    return "Cancelled. I will not %s." % what
 
 
 def claude_code_edit(request: str, folder: str = "", **_ignored) -> str:
     """Let Claude Code change files. Needs confirmation across two turns.
 
-    Any `confirm` argument the model supplies is deliberately ignored - see the
-    comment above _TURN. Extra kwargs are swallowed so an over-eager call cannot
-    raise a TypeError either.
+    Any `confirm` argument the model invents is swallowed and ignored.
     """
-    global _PENDING_EDIT
     if not str(request).strip():
         return "I need to know what to ask Claude Code to change, sir."
 
@@ -1765,35 +1819,13 @@ def claude_code_edit(request: str, folder: str = "", **_ignored) -> str:
     if not os.path.isdir(target):
         return path_not_found(folder or "the project folder")
 
-    key = (_squash(str(request)), os.path.normpath(target))
-
-    armed = (_PENDING_EDIT
-             and _PENDING_EDIT["key"] == key
-             and _PENDING_EDIT["turn"] < _TURN)
-
-    if armed and _user_said_yes():
-        _PENDING_EDIT = None
-        # Writes stay scoped to the target folder - no --add-dir on purpose.
-        return _run_claude(request, folder, "acceptEdits")
-
-    if armed:
-        # Armed, but this turn was not a yes. Keep waiting; do not run.
-        return (f"Still waiting for your go-ahead before letting Claude Code "
-                f"edit {target}. Say yes to confirm, or no to cancel.")
-
-    _PENDING_EDIT = {"key": key, "request": str(request),
-                     "folder": target, "turn": _TURN}
-    return (f"This will let Claude Code edit files in {target}. "
-            f"Ask the user to confirm out loud, then call this tool again.")
-
-
-def cancel_claude_edit() -> str:
-    """Drop any edit waiting for confirmation."""
-    global _PENDING_EDIT
-    if not _PENDING_EDIT:
-        return "There was nothing waiting for confirmation."
-    _PENDING_EDIT = None
-    return "Cancelled. Claude Code will not change anything."
+    go, msg = _confirm_gate(
+        "claude_edit:%s:%s" % (_squash(str(request)), os.path.normpath(target).lower()),
+        "let Claude Code edit files in %s" % target)
+    if not go:
+        return msg
+    # Writes stay scoped to the target folder - no --add-dir on purpose.
+    return _run_claude(request, folder, "acceptEdits")
 
 
 def where_is(name: str) -> str:
@@ -2212,8 +2244,8 @@ TOOL_REGISTRY = {
     "open_in_vscode":    open_in_vscode,
     "ask_claude_code":   ask_claude_code,
     "claude_code_edit":  claude_code_edit,
-    "cancel_claude_edit": cancel_claude_edit,
-    "pending_edit":      pending_edit,
+    "cancel_pending_action": cancel_pending_action,
+    "pending_action":    pending_action,
     # path discovery - stops any AI having to guess where folders are
     "where_is":          where_is,
     "list_known_folders": list_known_folders,
@@ -2268,10 +2300,11 @@ TOOL_SCHEMAS = [
         "until the user has actually said yes.",
         {"request": {"type": "string"},
          "folder": {"type": "string"}}, ["request"]),
-    _fn("cancel_claude_edit",
-        "Cancel a Claude Code edit that is waiting for confirmation."),
-    _fn("pending_edit",
-        "Report which Claude Code edit, if any, is awaiting confirmation."),
+    _fn("cancel_pending_action",
+        "Cancel whatever destructive action is waiting for confirmation. Call "
+        "this when the user says no."),
+    _fn("pending_action",
+        "Report which destructive action, if any, is awaiting confirmation."),
     _fn("where_is",
         "Find the real full path of a folder or file by its spoken name, e.g. "
         "'Jarvis AI', 'memories.txt', 'my downloads'. Use this before saying a "
@@ -2300,9 +2333,11 @@ TOOL_SCHEMAS = [
     _fn("copy_path", "Copy a file/folder",
         {"src": {"type": "string"}, "dst": {"type": "string"}},
         ["src", "dst"]),
-    _fn("delete_path", "Send a file/folder to Recycle Bin (needs confirm=true)",
-        {"path": {"type": "string"}, "confirm": {"type": "boolean"}},
-        ["path", "confirm"]),
+    _fn("delete_path",
+        "Send a file or folder to the Recycle Bin. Destructive: the first call "
+        "only ARMS it and returns a message to relay. Ask the user, then call "
+        "again on their next message.",
+        {"path": {"type": "string"}}, ["path"]),
     _fn("find_files", "Find files matching a glob pattern",
         {"pattern": {"type": "string"}, "search_root": {"type": "string"}},
         ["pattern"]),
@@ -2327,12 +2362,14 @@ TOOL_SCHEMAS = [
     # power
     _fn("lock_screen", "Lock the screen"),
     _fn("sleep_pc", "Put the PC to sleep"),
-    _fn("shutdown_pc", "Shut down (needs confirm=true)",
-        {"confirm": {"type": "boolean"}, "delay_seconds": {"type": "integer"}},
-        ["confirm"]),
-    _fn("restart_pc", "Restart (needs confirm=true)",
-        {"confirm": {"type": "boolean"}, "delay_seconds": {"type": "integer"}},
-        ["confirm"]),
+    _fn("shutdown_pc",
+        "Shut down the PC. Destructive: the first call only ARMS it and returns "
+        "a message to relay. Ask the user, then call again on their next reply.",
+        {"delay_seconds": {"type": "integer"}}, []),
+    _fn("restart_pc",
+        "Restart the PC. Destructive: the first call only ARMS it and returns a "
+        "message to relay. Ask the user, then call again on their next reply.",
+        {"delay_seconds": {"type": "integer"}}, []),
     _fn("abort_shutdown", "Cancel a pending shutdown"),
 
     # audio
@@ -2358,9 +2395,11 @@ TOOL_SCHEMAS = [
         {"name": {"type": "string"}}, ["name"]),
     _fn("list_running_apps", "List running apps"),
     _fn("list_installed_apps", "List installed apps from Start Menu"),
-    _fn("kill_process", "Kill a process by name (needs confirm=true)",
-        {"name": {"type": "string"}, "confirm": {"type": "boolean"}},
-        ["name", "confirm"]),
+    _fn("kill_process",
+        "Force an application to close, losing unsaved work. Destructive: the "
+        "first call only ARMS it and returns a message to relay. Ask the user, "
+        "then call again on their next reply.",
+        {"name": {"type": "string"}}, ["name"]),
 
     # window
     _fn("show_desktop", "Minimize all windows to show the desktop"),
@@ -2443,8 +2482,10 @@ TOOL_SCHEMAS = [
     _fn("docker_ps", "List running Docker containers"),
 
     # recycle
-    _fn("empty_recycle_bin", "Empty the Recycle Bin (needs confirm=true)",
-        {"confirm": {"type": "boolean"}}, ["confirm"]),
+    _fn("empty_recycle_bin",
+        "Permanently empty the Recycle Bin; this cannot be undone. Destructive: "
+        "the first call only ARMS it and returns a message to relay. Ask the "
+        "user, then call again on their next reply."),
 
     # env
     _fn("get_env", "Read an environment variable",

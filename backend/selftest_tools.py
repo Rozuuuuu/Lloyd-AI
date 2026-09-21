@@ -94,6 +94,31 @@ def _clipboard_roundtrip():
     return out
 
 
+def _delete_roundtrip():
+    """delete_path must REFUSE on the first call and only act after a real yes.
+
+    The old case passed confirm=True and asserted nothing. Once confirm became a
+    no-op, that case silently stopped testing deletion at all - it just armed a
+    pending action and passed on the arming message.
+    """
+    target = os.path.join(SANDBOX, "note_moved.txt")
+    if not os.path.exists(target):
+        raise AssertionError("sandbox file missing before the test")
+
+    tools.begin_turn("delete that file")
+    first = tools.delete_path(target)
+    if "confirm" not in first.lower():
+        raise AssertionError("first call did not ask to confirm: " + repr(first[:120]))
+    if not os.path.exists(target):
+        raise AssertionError("FILE WAS DELETED ON THE FIRST CALL")
+
+    tools.begin_turn("yes go ahead")
+    second = tools.delete_path(target)
+    if os.path.exists(target):
+        raise AssertionError("not deleted after confirming: " + repr(second[:120]))
+    return "refused, then deleted after yes"
+
+
 def _web_answer_works():
     """A known-answerable question must come back grounded, not empty."""
     out = tools.web_answer("what is the capital of France")
@@ -180,8 +205,7 @@ def _cases():
         ("unzip_path",          "safe", lambda: T.unzip_path(
             os.path.join(tempfile.gettempdir(), "jarvis_selftest.zip"),
             os.path.join(sb, "unzipped"))),
-        ("delete_path",         "safe", lambda: T.delete_path(
-            os.path.join(sb, "note_moved.txt"), confirm=True)),
+        ("delete_path",         "safe", _delete_roundtrip),
         ("open_path",           "loud", lambda: T.open_path(sb)),
 
         # ---- screen -----------------------------------------------------
@@ -268,9 +292,9 @@ def _cases():
         ("list_voices",         "safe", lambda: T.list_voices()),
         ("set_voice",           "safe", _voice_roundtrip),
 
-        # ---- claude edit queue ------------------------------------------
-        ("pending_edit",        "safe", lambda: T.pending_edit()),
-        ("cancel_claude_edit",  "safe", lambda: T.cancel_claude_edit()),
+        # ---- destructive-action confirmation queue ----------------------
+        ("pending_action",      "safe", lambda: T.pending_action()),
+        ("cancel_pending_action", "safe", lambda: T.cancel_pending_action()),
 
         # ---- paths ------------------------------------------------------
         ("where_is",            "safe", lambda: T.where_is("Jarvis AI")),

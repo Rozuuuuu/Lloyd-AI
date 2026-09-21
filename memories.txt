@@ -1729,3 +1729,202 @@ All three phases of the voice-assistant work are now done:
 ================================================================================
  End of session 6.
 ================================================================================
+
+
+================================================================================
+ SESSION 7 - 2026-09-22
+ Goal   : (a) put this project under git
+          (b) close the confirm= hole on the five remaining destructive tools
+ Result : both done. The project has real history now, and all six destructive
+          tools survive a 63-case adversarial test suite.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ S7-1. GIT
+--------------------------------------------------------------------------------
+
+The undo system was 13 .bak files across four generations of tools.py. Already
+ambiguous: nothing on disk said whether tools.py.bak2 was before or after the
+path fix.
+
+  git init, branch master, initial commit d3351e5, 27 files.
+
+.gitignore excludes, and each exclusion is deliberate:
+
+  jarvis-env/ venv/ backend/jarvis-env/   the environments. jarvis-env is the
+                                          live one; the other two are empty
+                                          leftovers. Recreate from
+                                          requirements.txt.
+  models/piper/*.onnx                     63 MB each, re-downloadable. The
+                                          Hugging Face URL pattern is in the
+                                          .gitignore comment so it is not lost.
+  backend/data/*.db                        PRIVACY. jarvis_memory.db holds
+                                          remembered personal facts and full
+                                          conversation history. This must never
+                                          be committed.
+  *.bak, *.bak[0-9]                       superseded by git history. They are
+                                          still on disk and are now safe to
+                                          delete whenever you like.
+  capability_report.txt, command_report.txt  regenerated output, not source
+  *.zip                                   first_aid_assignment.zip and
+                                          zipped_pdf.zip are unrelated personal
+                                          files that happen to live in this
+                                          folder. They were explicitly removed
+                                          from the commit rather than versioned
+                                          into a code repo. Delete the *.zip line
+                                          if you disagree.
+
+Each exclusion was verified with git check-ignore, not assumed.
+
+Still no remote, and nothing was pushed.
+
+
+--------------------------------------------------------------------------------
+ S7-2. THE confirm= HOLE, NOW CLOSED EVERYWHERE
+--------------------------------------------------------------------------------
+
+Session 2 demonstrated that `confirm: bool = False` is not a safety gate: the
+model simply passes confirm=true on its first call. It did exactly that and
+edited memory.py with nobody's approval. Only claude_code_edit was fixed at the
+time. These five were left on the broken pattern, and two of them power off the
+PC:
+
+  delete_path   shutdown_pc   restart_pc   kill_process   empty_recycle_bin
+
+All five now route through a single generic gate, tools._confirm_gate(key, what):
+
+  - `confirm` is GONE from all six schemas, so the model cannot supply it. Any
+    confirm kwarg it invents anyway is swallowed by **_ignored and ignored.
+  - The action is ARMED on one turn and can only RUN on a LATER turn, where
+    "turn" is defined by brain.py calling tools.begin_turn() once per user
+    message.
+  - It runs only when the user's own words in that later turn were affirmative.
+    An explicit refusal wins even inside a sentence containing "yes".
+  - `key` identifies the exact action, so approving a shutdown cannot authorise
+    a restart, and approving the deletion of one file cannot delete another.
+  - Approval is single-use. It is cleared when consumed.
+
+claude_code_edit was refactored onto the same gate rather than keeping a second
+parallel mechanism. pending_edit and cancel_claude_edit became pending_action and
+cancel_pending_action, since confirmation is no longer a Claude-Code-specific
+concern.
+
+Two details worth remembering:
+  - shutdown and restart leave delay_seconds OUT of the key. Otherwise the model
+    changing the delay between turns would silently re-arm instead of running.
+  - kill_process phrases itself as "force X to close, losing anything unsaved",
+    because that is what the user needs to hear before saying yes.
+
+brain.py integration: its pending-action check read tools._PENDING_EDIT. Renaming
+the variable without updating that would have silently broken the hands-free
+yes/no gating - the getattr would just return None forever. It now reads
+_PENDING, and while anything is armed BOTH the devcode and power categories are
+pinned into scope so the confirm and cancel tools stay reachable.
+
+
+--------------------------------------------------------------------------------
+ S7-3. NEW: backend/test_guards.py
+--------------------------------------------------------------------------------
+
+The confirmation gate was previously only checked by one weak assertion. It is
+now attacked properly. 63 cases, and nothing is really destroyed: subprocess.run
+and send2trash are swapped for recorders, so "did it act?" is answerable without
+shutting the PC down.
+
+Nine attacks per tool, across all five plus claude_code_edit:
+
+  1. a single call must not act
+  2. confirm=True on the first call must be ignored   <- the actual session-2 bug
+  3. two calls inside one turn must not act
+  4. a later turn that was not a yes must not act
+  5. an explicit "no" must not act
+  6. "yes but actually don't" must not act
+  7. consent must not transfer to a different action
+  8. a genuine yes MUST act (the gate has to still open)
+  9. approval is single-use, not reusable
+
+Plus: pending_action reports correctly, cancel clears it, and a cancelled action
+cannot be resurrected by a later "yes".
+
+  cd "C:\\Users\\Home\\Desktop\\AI\\Jarvis AI\\backend"
+  ..\\jarvis-env\\Scripts\\python.exe test_guards.py
+
+
+--------------------------------------------------------------------------------
+ S7-4. A TEST THAT HAD SILENTLY STOPPED TESTING
+--------------------------------------------------------------------------------
+
+Worth recording as a pattern, not just an incident.
+
+selftest_tools.py had:
+
+    ("delete_path", "safe", lambda: T.delete_path(path, confirm=True))
+
+Once confirm became a no-op, that call only ARMED a pending delete and returned
+the arming message. No fail markers in the string, so it PASSED - while testing
+nothing at all. It was noticed only because pending_action, several cases later,
+reported "Awaiting your confirmation to move ...note_moved.txt", which should
+have been impossible in a clean run.
+
+Replaced with _delete_roundtrip(), which asserts the file still exists after the
+first call, then asserts it is gone after a genuine yes. It now reports
+"refused, then deleted after yes".
+
+Lesson: a test whose assertion is "the output contains no error words" will
+happily pass when the behaviour disappears.
+
+
+--------------------------------------------------------------------------------
+ S7-5. FILES CHANGED IN SESSION 7
+--------------------------------------------------------------------------------
+
+ADDED
+  .gitignore
+  backend/test_guards.py      63 adversarial confirmation tests
+
+MODIFIED
+  backend/tools.py            generic _confirm_gate, pending_action,
+                              cancel_pending_action; delete_path, shutdown_pc,
+                              restart_pc, kill_process, empty_recycle_bin and
+                              claude_code_edit converted; confirm removed from
+                              all six schemas
+  backend/brain.py            categories renamed, _PENDING rename, power pinned
+                              while an action is armed
+  backend/selftest_tools.py   delete_path now tests the real two-turn flow;
+                              renamed queue cases
+
+Tool counts: registry 89, schemas 89, categories 89. Zero drift.
+
+
+--------------------------------------------------------------------------------
+ S7-6. VERIFICATION - SESSION 7
+--------------------------------------------------------------------------------
+
+  git check-ignore on private/large files           all correctly excluded
+  git tree after commit                             clean
+  All Python modules compile                        clean
+  registry / schemas / categories                   89 / 89 / 89, zero drift
+  confirm present in any schema                     none
+  test_guards.py                                    63 PASS, 0 FAIL
+  selftest_tools.py                                 44 PASS, 1 FAIL (docker)
+  test_commands.py                                  30 PASS, 0 FAIL
+  verify_ui.py                                      56 PASS
+  test_ui.js / test_audio.js / test_handsfree.js    45 / 19 / 31, no regressions
+
+  288 checks passing across seven suites. The only failure anywhere is
+  docker_ps, because Docker Desktop is not running.
+
+WHAT IS STILL OPEN
+  - Nothing on a real phone has been verified by ear or by touch. All frontend
+    testing is jsdom with a stubbed mic and speaker.
+  - claude_code_edit ROUTING is still roughly 3 in 5 (the gate is solid; the
+    model reaching for the tool is not). The pre-router built in session 6 could
+    be extended to it.
+  - No general web search without BRAVE_API_KEY.
+  - The Notes file still describes the old setup and points at the empty venv/.
+  - RAM sat at 84% with 2.5 GB free during this session, 7b model only.
+
+================================================================================
+ End of session 7.
+================================================================================

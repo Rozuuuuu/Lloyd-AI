@@ -149,8 +149,11 @@ TOOL_CATEGORY = {
     "set_speech_pace": "speech", "get_speech_pace": "speech",
     "set_voice": "speech", "list_voices": "speech",
     "open_in_vscode": "devcode", "ask_claude_code": "devcode",
-    "claude_code_edit": "devcode", "cancel_claude_edit": "devcode",
-    "pending_edit": "devcode",
+    "claude_code_edit": "devcode",
+    # Confirmation control is not devcode-specific any more: it gates deletes,
+    # shutdowns and process kills too. "power" is the broadest destructive
+    # category, and the pending-action pin below keeps it reachable regardless.
+    "cancel_pending_action": "power", "pending_action": "power",
     "where_is": "files", "list_known_folders": "files",
     "ask_deepseek": "ai", "ask_chatgpt": "ai",
     "ask_claude": "ai", "ask_gemini": "ai",
@@ -349,8 +352,8 @@ SCORE_MARGIN = 4
 
 
 def _edit_is_pending() -> bool:
-    """True while a Claude Code edit is waiting for the user's yes or no."""
-    return getattr(_tools, "_PENDING_EDIT", None) is not None
+    """True while any destructive action is waiting for the user's yes or no."""
+    return getattr(_tools, "_PENDING", None) is not None
 
 
 def _looks_like_command(t: str) -> bool:
@@ -449,6 +452,7 @@ def relevant_schemas(user_text: str):
     # model wandered off into list_dir. Keep it available until resolved.
     if _edit_is_pending():
         scores["devcode"] = max(scores.get("devcode", 0), 99)
+        scores["power"] = max(scores.get("power", 0), 99)
 
     memory_hit = "memory" in scores
     ai_hit = "ai" in scores
